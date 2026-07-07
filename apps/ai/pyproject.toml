@@ -1,0 +1,36 @@
+[project]
+name = "aegispro-ai"
+version = "0.1.0"
+description = "Independent AI inference service for the AegisPro surveillance platform."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "pillow>=10.4.0",
+  "pydantic-settings>=2.4.0",
+  "uvicorn[standard]>=0.30.6"
+]
+
+[project.optional-dependencies]
+model = [
+  "ultralytics>=8.3.0"
+]
+recognition = [
+  "insightface>=0.7.3",
+  "numpy>=1.26.4",
+  "onnxruntime>=1.18.1"
+]
+dev = [
+  "pytest>=8.3.2",
+  "ruff>=0.6.2"
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
