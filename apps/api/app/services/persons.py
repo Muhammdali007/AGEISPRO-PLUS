@@ -25,7 +25,13 @@ class PersonService:
         face_enrollment: FaceEnrollmentService | None = None,
     ) -> None:
         self.repository = repository
-        self.face_enrollment = face_enrollment or FaceEnrollmentService()
+        self._face_enrollment = face_enrollment
+
+    @property
+    def face_enrollment(self) -> FaceEnrollmentService:
+        if self._face_enrollment is None:
+            self._face_enrollment = FaceEnrollmentService()
+        return self._face_enrollment
 
     async def list(self) -> list[Person]:
         return await self.repository.list()

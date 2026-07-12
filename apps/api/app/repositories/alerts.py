@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alert import Alert, AlertStatus
@@ -32,6 +32,15 @@ class AlertRepository:
 
     async def get(self, alert_id: UUID) -> Alert | None:
         return await self.session.get(Alert, alert_id)
+
+    async def count_since(self, *, started_at: datetime, status: AlertStatus | None = None) -> int:
+        query = select(func.count(Alert.id)).where(Alert.created_at >= started_at)
+        if status:
+            query = query.where(Alert.status == status)
+        return int((await self.session.execute(query)).scalar_one() or 0)
+
+    async def count_all(self) -> int:
+        return int((await self.session.execute(select(func.count()).select_from(Alert))).scalar_one())
 
     async def create(self, payload: AlertCreate) -> Alert:
         alert = Alert(**payload.model_dump())

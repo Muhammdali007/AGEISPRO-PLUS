@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from io import BytesIO
+from pathlib import Path
 
 from app.core.config import settings
+
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 
 class FaceEmbeddingError(RuntimeError):
@@ -54,6 +58,11 @@ class InsightFaceEmbeddingBackend(FaceEmbeddingBackend):
     backend_name = "insightface"
 
     def __init__(self) -> None:
+        if "INSIGHTFACE_HOME" not in os.environ:
+            insightface_home = PROJECT_ROOT / "storage" / "insightface"
+            insightface_home.mkdir(parents=True, exist_ok=True)
+            os.environ["INSIGHTFACE_HOME"] = str(insightface_home)
+
         try:
             import numpy as np
             from PIL import Image

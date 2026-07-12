@@ -42,6 +42,7 @@ export function statusTone(
     case "administrator":
       return "bg-red-500/15 text-red-200 ring-1 ring-red-400/30";
     case "degraded":
+    case "warning":
     case "acknowledged":
     case "investigating":
     case "supervisor":
@@ -53,6 +54,7 @@ export function statusTone(
     case "low":
     case "medium":
     case "cleared":
+    case "info":
     case "offline":
     case "unknown":
     default:

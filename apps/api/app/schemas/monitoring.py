@@ -87,6 +87,59 @@ class SystemHealthReport(BaseModel):
     ai: AiRuntimeHealth
 
 
+class OptimizationResourceSnapshot(BaseModel):
+    incidents_total: int
+    incidents_last_24h: int
+    active_alerts_total: int
+    alerts_last_24h: int
+    audit_logs_total: int
+    audit_logs_last_24h: int
+
+
+class DatabaseOptimizationReport(BaseModel):
+    status: str
+    pool_size: int
+    max_overflow: int
+    pool_recycle_seconds: int
+    indexed_paths: list[str] = Field(default_factory=list)
+    resources: OptimizationResourceSnapshot
+    detail: str | None = None
+
+
+class RedisOptimizationReport(BaseModel):
+    status: str
+    ping_ms: float | None = None
+    used_memory_human: str | None = None
+    connected_clients: int | None = None
+    pubsub_channels: int | None = None
+    detail: str | None = None
+
+
+class RuntimeOptimizationReport(BaseModel):
+    status: str
+    inference_backend: str | None = None
+    recognition_backend: str | None = None
+    gpu_available: bool
+    gpu_utilization_percent: float | None = None
+    gpu_memory_used_mb: int | None = None
+    gpu_memory_total_mb: int | None = None
+    detail: str | None = None
+
+
+class OptimizationRecommendation(BaseModel):
+    title: str
+    detail: str
+    severity: Literal["info", "warning", "critical"]
+
+
+class OptimizationReport(BaseModel):
+    generated_at: datetime
+    database: DatabaseOptimizationReport
+    redis: RedisOptimizationReport
+    runtime: RuntimeOptimizationReport
+    recommendations: list[OptimizationRecommendation]
+
+
 class MonitoringOverview(BaseModel):
     window: MonitoringWindow
     generated_at: datetime

@@ -1,7 +1,7 @@
 from uuid import UUID
 
 from app.core.security import TokenType, create_token, decode_token, verify_password
-from app.models.user import User, UserRole
+from app.models.user import User
 from app.repositories.users import UserRepository
 from app.schemas.auth import SignupRequest
 from app.schemas.users import UserCreate

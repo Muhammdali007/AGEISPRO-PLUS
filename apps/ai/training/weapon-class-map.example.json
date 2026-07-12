@@ -1,0 +1,10 @@
+{
+  "knife": "knife",
+  "scissor": "scissors",
+  "scissors": "scissors",
+  "pistol": "pistol",
+  "handgun": "pistol",
+  "gun": "gun",
+  "rifle": "gun",
+  "firearm": "gun"
+}

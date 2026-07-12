@@ -1,9 +1,10 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.models.incident import DetectionType, IncidentPriority
 from app.repositories.alerts import AlertRepository
 from app.repositories.cameras import CameraRepository
@@ -32,12 +33,17 @@ class DetectionEventService:
         self.persons = PersonService(PersonRepository(session))
         self.evidence = EvidenceStorageService()
 
-    async def ingest(self, payload: DetectionEventIngest) -> DetectionEventIngestResponse:
+    async def ingest(
+        self,
+        payload: DetectionEventIngest,
+        *,
+        allow_disabled_camera: bool = False,
+    ) -> DetectionEventIngestResponse:
         camera = await self.cameras.get(payload.camera_id)
         if not camera:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Camera not found")
 
-        if not camera.detection_enabled:
+        if not camera.detection_enabled and not allow_disabled_camera:
             return DetectionEventIngestResponse(
                 camera_id=payload.camera_id,
                 incident_count=0,
@@ -59,6 +65,16 @@ class DetectionEventService:
                 continue
 
             self._validate_inline_evidence(payload, detection)
+            if await self._is_recent_duplicate(
+                camera_id=payload.camera_id,
+                detection_type=detection_type,
+                detection=detection,
+                occurred_at=occurred_at,
+            ):
+                ignored_reasons.append(
+                    f"Duplicate {detection_type.value} detection suppressed within the cooldown window."
+                )
+                continue
             priority = self._priority_for_detection(detection_type)
             recognized_identity = self._recognized_identity_for_detection(detection)
             incident = await self.incidents.create(
@@ -148,6 +164,49 @@ class DetectionEventService:
             ignored_reasons=ignored_reasons,
         )
 
+    async def _is_recent_duplicate(
+        self,
+        *,
+        camera_id,
+        detection_type: DetectionType,
+        detection: DetectionEventIngestItem,
+        occurred_at: datetime,
+    ) -> bool:
+        recent = await self.incidents.recent_for_detection(
+            camera_id=camera_id,
+            detection_type=detection_type,
+            since=occurred_at - timedelta(seconds=settings.detection_duplicate_window_seconds),
+        )
+        if not recent:
+            return False
+        for incident in recent:
+            if detection.track_id and incident.metadata_.get("track_id") == detection.track_id:
+                return True
+            if detection.identity_id and str(detection.identity_id) == str(
+                (incident.recognized_identity or {}).get("identity_id")
+            ):
+                return True
+            if detection.bounding_box and incident.bounding_boxes:
+                if self._box_iou(detection.bounding_box.model_dump(), incident.bounding_boxes[0]) >= 0.7:
+                    return True
+        return False
+
+    @staticmethod
+    def _box_iou(first: dict, second: dict) -> float:
+        left = max(float(first.get("x1", 0)), float(second.get("x1", 0)))
+        top = max(float(first.get("y1", 0)), float(second.get("y1", 0)))
+        right = min(float(first.get("x2", 0)), float(second.get("x2", 0)))
+        bottom = min(float(first.get("y2", 0)), float(second.get("y2", 0)))
+        intersection = max(0.0, right - left) * max(0.0, bottom - top)
+        first_area = max(0.0, float(first.get("x2", 0)) - float(first.get("x1", 0))) * max(
+            0.0, float(first.get("y2", 0)) - float(first.get("y1", 0))
+        )
+        second_area = max(0.0, float(second.get("x2", 0)) - float(second.get("x1", 0))) * max(
+            0.0, float(second.get("y2", 0)) - float(second.get("y1", 0))
+        )
+        union = first_area + second_area - intersection
+        return intersection / union if union > 0 else 0.0
+
     def _validate_inline_evidence(
         self,
         payload: DetectionEventIngest,
@@ -195,8 +254,6 @@ class DetectionEventService:
     def _should_create_alert(detection_type: DetectionType) -> bool:
         return detection_type in {
             DetectionType.weapon,
-            DetectionType.fire,
-            DetectionType.smoke,
         }
 
     @staticmethod

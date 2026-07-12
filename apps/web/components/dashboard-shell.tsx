@@ -174,7 +174,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
           <header className="rounded-[28px] border border-white/10 bg-panel/70 px-5 py-4 shadow-xl backdrop-blur">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
               <div>
-                <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Phase 8 monitoring</p>
+                <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Phase 9 optimization</p>
                 <h1 className="mt-2 text-2xl font-semibold">Live operations workspace</h1>
               </div>
               <div className="flex flex-wrap items-center gap-3">

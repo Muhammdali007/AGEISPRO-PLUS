@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: aegispro-ai
+Version: 0.1.0
+Summary: Independent AI inference service for the AegisPro surveillance platform.
+Requires-Python: >=3.11
+Requires-Dist: fastapi>=0.115.0
+Requires-Dist: pillow>=10.4.0
+Requires-Dist: pydantic-settings>=2.4.0
+Requires-Dist: uvicorn[standard]>=0.30.6
+Provides-Extra: model
+Requires-Dist: ultralytics>=8.3.0; extra == "model"
+Provides-Extra: recognition
+Requires-Dist: insightface>=0.7.3; extra == "recognition"
+Requires-Dist: numpy>=1.26.4; extra == "recognition"
+Requires-Dist: onnxruntime>=1.18.1; extra == "recognition"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.3.2; extra == "dev"
+Requires-Dist: ruff>=0.6.2; extra == "dev"

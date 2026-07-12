@@ -17,6 +17,11 @@ Requires-Dist: python-multipart>=0.0.9
 Requires-Dist: redis>=5.0.8
 Requires-Dist: sqlalchemy>=2.0.32
 Requires-Dist: uvicorn[standard]>=0.30.6
+Provides-Extra: recognition
+Requires-Dist: insightface>=0.7.3; extra == "recognition"
+Requires-Dist: numpy>=1.26.4; extra == "recognition"
+Requires-Dist: onnxruntime>=1.18.1; extra == "recognition"
+Requires-Dist: pillow>=10.4.0; extra == "recognition"
 Provides-Extra: dev
 Requires-Dist: aiosqlite>=0.20.0; extra == "dev"
 Requires-Dist: httpx>=0.27.0; extra == "dev"

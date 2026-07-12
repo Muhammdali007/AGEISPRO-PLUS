@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-aegispro}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -23,7 +23,7 @@ services:
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -32,17 +32,108 @@ services:
       timeout: 5s
       retries: 5
 
+  api:
+    build:
+      context: ./apps/api
+    container_name: aegispro-api
+    restart: unless-stopped
+    command: >
+      sh -c "alembic upgrade head &&
+      uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    env_file:
+      - ./.env.production
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      AI_SERVICE_URL: ${AI_SERVICE_URL}
+      SECRET_KEY: ${SECRET_KEY}
+      SERVICE_CALLBACK_TOKEN: ${SERVICE_CALLBACK_TOKEN}
+      ACCESS_TOKEN_MINUTES: ${ACCESS_TOKEN_MINUTES}
+      REFRESH_TOKEN_DAYS: ${REFRESH_TOKEN_DAYS}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      AUTO_CREATE_TABLES: ${AUTO_CREATE_TABLES}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD}
+      STORAGE_ROOT: ${STORAGE_ROOT}
+      API_CONTINUOUS_DETECTION_ENABLED: ${API_CONTINUOUS_DETECTION_ENABLED}
+      API_DETECTION_DUPLICATE_WINDOW_SECONDS: ${API_DETECTION_DUPLICATE_WINDOW_SECONDS}
+      API_RECOGNITION_BACKEND: ${API_RECOGNITION_BACKEND}
+      API_RECOGNITION_ALLOW_FALLBACK: ${API_RECOGNITION_ALLOW_FALLBACK}
+      API_RECOGNITION_INSIGHTFACE_MODEL: ${API_RECOGNITION_INSIGHTFACE_MODEL}
+      API_RECOGNITION_INSIGHTFACE_PROVIDERS: ${API_RECOGNITION_INSIGHTFACE_PROVIDERS}
+      API_RECOGNITION_INSIGHTFACE_CTX_ID: ${API_RECOGNITION_INSIGHTFACE_CTX_ID}
+      API_RECOGNITION_INSIGHTFACE_DET_SIZE: ${API_RECOGNITION_INSIGHTFACE_DET_SIZE}
+      ENVIRONMENT: ${ENVIRONMENT}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ai:
+        condition: service_started
+    volumes:
+      - ./storage:/app/storage
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  ai:
+    build:
+      context: ./apps/ai
+    container_name: aegispro-ai
+    restart: unless-stopped
+    env_file:
+      - ./.env.production
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT}
+      AI_MODEL_BACKEND: ${AI_MODEL_BACKEND}
+      AI_MODEL_NAME: ${AI_MODEL_NAME}
+      AI_MODEL_VERSION: ${AI_MODEL_VERSION}
+      AI_MODEL_FALLBACK_BACKEND: ${AI_MODEL_FALLBACK_BACKEND}
+      AI_ALLOW_BACKEND_FALLBACK: ${AI_ALLOW_BACKEND_FALLBACK}
+      AI_MODEL_WEIGHTS_PATH: ${AI_MODEL_WEIGHTS_PATH}
+      AI_MODEL_PERSON_WEAPON_WEIGHTS_PATH: ${AI_MODEL_PERSON_WEAPON_WEIGHTS_PATH}
+      AI_MODEL_WEAPON_WEIGHTS_PATH: ${AI_MODEL_WEAPON_WEIGHTS_PATH}
+      AI_MODEL_FIRE_SMOKE_WEIGHTS_PATH: ${AI_MODEL_FIRE_SMOKE_WEIGHTS_PATH}
+      AI_MODEL_DEVICE: ${AI_MODEL_DEVICE}
+      AI_MODEL_IMAGE_SIZE: ${AI_MODEL_IMAGE_SIZE}
+      AI_MODEL_HALF_PRECISION: ${AI_MODEL_HALF_PRECISION}
+      AI_MODEL_TRACKER_CONFIG: ${AI_MODEL_TRACKER_CONFIG}
+      AI_MODEL_TRACK_PERSIST: ${AI_MODEL_TRACK_PERSIST}
+      AI_CONFIDENCE_THRESHOLD: ${AI_CONFIDENCE_THRESHOLD}
+      AI_PERSON_CONFIDENCE_THRESHOLD: ${AI_PERSON_CONFIDENCE_THRESHOLD}
+      AI_WEAPON_CONFIDENCE_THRESHOLD: ${AI_WEAPON_CONFIDENCE_THRESHOLD}
+      AI_FIRE_CONFIDENCE_THRESHOLD: ${AI_FIRE_CONFIDENCE_THRESHOLD}
+      AI_SMOKE_CONFIDENCE_THRESHOLD: ${AI_SMOKE_CONFIDENCE_THRESHOLD}
+      AI_INFERENCE_FPS: ${AI_INFERENCE_FPS}
+      AI_RECOGNITION_BACKEND: ${AI_RECOGNITION_BACKEND}
+      AI_RECOGNITION_ALLOW_FALLBACK: ${AI_RECOGNITION_ALLOW_FALLBACK}
+      AI_RECOGNITION_INSIGHTFACE_MODEL: ${AI_RECOGNITION_INSIGHTFACE_MODEL}
+      AI_RECOGNITION_INSIGHTFACE_PROVIDERS: ${AI_RECOGNITION_INSIGHTFACE_PROVIDERS}
+      AI_RECOGNITION_INSIGHTFACE_CTX_ID: ${AI_RECOGNITION_INSIGHTFACE_CTX_ID}
+      AI_RECOGNITION_INSIGHTFACE_DET_SIZE: ${AI_RECOGNITION_INSIGHTFACE_DET_SIZE}
+      AI_ENABLE_EVENT_CALLBACK: ${AI_ENABLE_EVENT_CALLBACK}
+      AI_API_EVENT_CALLBACK_URL: ${AI_API_EVENT_CALLBACK_URL}
+      AI_API_EVENT_CALLBACK_TOKEN: ${AI_API_EVENT_CALLBACK_TOKEN}
+    volumes:
+      - ./storage:/app/storage
+    ports:
+      - "127.0.0.1:8100:8100"
+
   web:
     build:
       context: ./apps/web
     container_name: aegispro-web
     restart: unless-stopped
+    env_file:
+      - ./.env.production
     environment:
-      NEXT_PUBLIC_API_URL: ${WEB_PUBLIC_API_URL:-http://localhost:8000}
+      NEXT_PUBLIC_API_URL: ${WEB_PUBLIC_API_URL}
+      API_PROXY_TARGET: ${WEB_API_PROXY_TARGET}
     ports:
-      - "3000:3000"
-    profiles:
-      - web
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      api:
+        condition: service_started
 
   nginx:
     image: nginx:1.27-alpine
@@ -54,10 +145,7 @@ services:
       - ./infra/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       - web
-    profiles:
-      - web
 
 volumes:
   postgres_data:
   redis_data:
-

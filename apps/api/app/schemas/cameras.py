@@ -5,6 +5,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.camera import CameraSourceType, CameraStatus
+from app.schemas.detections import DetectionBoundingBox
 
 
 class CameraBase(BaseModel):
@@ -98,3 +99,39 @@ class CameraLiveMonitorResponse(BaseModel):
 
 class CameraConnectionBatch(BaseModel):
     results: list[CameraConnectionTest]
+
+
+class CameraDetectionScanRequest(BaseModel):
+    frame_content_base64: str | None = Field(default=None, min_length=1)
+    frame_content_type: str | None = Field(default="image/jpeg", max_length=120)
+    include_evidence: bool = True
+    requested_detectors: list[str] = Field(
+        default_factory=lambda: ["weapon", "person", "fire", "smoke"]
+    )
+    recognition_enabled: bool = False
+    occurrence_hint: str | None = Field(default=None, max_length=64)
+
+
+class CameraDetectionScanSummary(BaseModel):
+    detection_type: str
+    confidence: float
+    track_id: str | None = None
+    recognition_status: str | None = None
+    identity_label: str | None = None
+    bounding_box: DetectionBoundingBox | None = None
+    face_bounding_box: DetectionBoundingBox | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CameraDetectionScanResponse(BaseModel):
+    camera_id: UUID
+    model_name: str
+    model_version: str
+    detection_count: int
+    incident_count: int
+    alert_count: int
+    ignored_count: int
+    detections: list[CameraDetectionScanSummary] = Field(default_factory=list)
+    ignored_reasons: list[str] = Field(default_factory=list)
+    backend: str | None = None
+    callback_delivered: bool = False

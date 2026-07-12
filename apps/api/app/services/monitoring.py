@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.camera import Camera
+from app.models.alert import AlertStatus
 from app.repositories.alerts import AlertRepository
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.cameras import CameraRepository
@@ -38,40 +39,28 @@ class MonitoringService:
         now = datetime.now(UTC)
         started_at = now - self._window_delta(window)
         cameras = await self.cameras.list()
-        incidents = [
-            incident
-            for incident in await self.incidents.list()
-            if self._ensure_utc(incident.occurred_at) >= started_at
-        ]
-        alerts = [
-            alert
-            for alert in await self.alerts.list()
-            if self._ensure_utc(alert.created_at) >= started_at
-        ]
+        incident_volume, average_confidence = await self.incidents.summary_since(started_at)
+        incident_timestamps = await self.incidents.timestamps_since(started_at)
+        detection_mix = await self.incidents.detection_mix_since(started_at)
+        active_alerts = await self.alerts.count_since(
+            started_at=started_at, status=AlertStatus.active
+        )
 
         online = sum(camera.status.value == "online" for camera in cameras)
-        average_confidence = (
-            round(sum(incident.confidence for incident in incidents) / len(incidents), 4)
-            if incidents
-            else 0.0
-        )
 
         return MonitoringOverview(
             window=window,
             generated_at=now,
             kpis=MonitoringKpis(
-                incident_volume=len(incidents),
-                active_alerts=sum(alert.status.value == "active" for alert in alerts),
+                incident_volume=incident_volume,
+                active_alerts=active_alerts,
                 online_camera_ratio=round((online / len(cameras)) if cameras else 0.0, 4),
-                average_confidence=average_confidence,
+                average_confidence=round(average_confidence, 4),
             ),
-            incidents_over_time=self._bucket_incidents(incidents, started_at, now, window),
+            incidents_over_time=self._bucket_incidents(incident_timestamps, started_at, now, window),
             detection_mix=[
-                DetectionMixPoint(detection_type=key, count=value)
-                for key, value in sorted(
-                    Counter(incident.detection_type.value for incident in incidents).items(),
-                    key=lambda item: (-item[1], item[0]),
-                )
+                DetectionMixPoint(detection_type=detection_type, count=count)
+                for detection_type, count in detection_mix
             ],
             camera_health=self._camera_health_summary(cameras, now),
             system_health=await collect_system_health(self.session),
@@ -153,7 +142,12 @@ class MonitoringService:
         )
 
     @staticmethod
-    def _bucket_incidents(incidents: list, started_at: datetime, now: datetime, window: MonitoringWindow) -> list[MonitoringSeriesPoint]:
+    def _bucket_incidents(
+        incident_timestamps: list[datetime],
+        started_at: datetime,
+        now: datetime,
+        window: MonitoringWindow,
+    ) -> list[MonitoringSeriesPoint]:
         if window == "24h":
             bucket_count = 24
             step = timedelta(hours=1)
@@ -177,8 +171,8 @@ class MonitoringService:
         points: list[MonitoringSeriesPoint] = []
         for bucket_start, bucket_end in buckets:
             count = sum(
-                bucket_start <= MonitoringService._ensure_utc(incident.occurred_at) < bucket_end
-                for incident in incidents
+                bucket_start <= MonitoringService._ensure_utc(timestamp) < bucket_end
+                for timestamp in incident_timestamps
             )
             points.append(
                 MonitoringSeriesPoint(

@@ -30,7 +30,7 @@ type CreatePersonForm = z.infer<typeof createPersonSchema>;
 export default function CreatePersonPage() {
   const router = useRouter();
   const queryClient = useQueryClient();
-  const { accessToken, user } = useAuthStore();
+  const { accessToken, user, logout } = useAuthStore();
   const [error, setError] = useState<string | null>(null);
   const [uploadFiles, setUploadFiles] = useState<File[]>([]);
   const [uploadPrimary, setUploadPrimary] = useState(true);
@@ -74,13 +74,18 @@ export default function CreatePersonPage() {
       router.push(`/dashboard/persons/${person.id}`);
     },
     onError: (cause) => {
+      if (cause instanceof Error && (cause.message === "Invalid credentials" || cause.message === "Session expired")) {
+        logout();
+        router.push("/login");
+        return;
+      }
       setError(cause instanceof Error ? cause.message : "Unable to create person");
     }
   });
 
-  async function onSubmit(values: CreatePersonForm) {
+  function onSubmit(values: CreatePersonForm) {
     setError(null);
-    await createPersonMutation.mutateAsync(values);
+    createPersonMutation.mutate(values);
   }
 
   if (user?.role && user.role !== "administrator" && user.role !== "supervisor" && user.role !== "operator") {

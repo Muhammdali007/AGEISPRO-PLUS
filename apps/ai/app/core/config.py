@@ -1,9 +1,11 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
-from pydantic import field_validator
+
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 
 class Settings(BaseSettings):
@@ -18,6 +20,18 @@ class Settings(BaseSettings):
     model_name: str = Field(default="yolo11", validation_alias=AliasChoices("AI_MODEL_NAME"))
     model_version: str = Field(default="phase5-sim", validation_alias=AliasChoices("AI_MODEL_VERSION"))
     model_weights_path: str = Field(default="yolo11n.pt", validation_alias=AliasChoices("AI_MODEL_WEIGHTS_PATH"))
+    model_person_weapon_weights_path: str | None = Field(
+        default="storage/models/yolo11n.pt",
+        validation_alias=AliasChoices("AI_MODEL_PERSON_WEAPON_WEIGHTS_PATH"),
+    )
+    model_weapon_weights_path: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_MODEL_WEAPON_WEIGHTS_PATH"),
+    )
+    model_fire_smoke_weights_path: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_MODEL_FIRE_SMOKE_WEIGHTS_PATH"),
+    )
     model_device: str | None = Field(default=None, validation_alias=AliasChoices("AI_MODEL_DEVICE"))
     model_image_size: int = Field(default=640, ge=64, validation_alias=AliasChoices("AI_MODEL_IMAGE_SIZE"))
     model_half_precision: bool = Field(default=False, validation_alias=AliasChoices("AI_MODEL_HALF_PRECISION"))
@@ -28,7 +42,19 @@ class Settings(BaseSettings):
     model_track_persist: bool = Field(default=True, validation_alias=AliasChoices("AI_MODEL_TRACK_PERSIST"))
     model_label_aliases: Annotated[dict[str, list[str]], NoDecode] = Field(
         default_factory=lambda: {
-            "weapon": ["weapon", "gun", "knife", "pistol", "rifle", "firearm", "handgun"],
+            "weapon": [
+                "weapon",
+                "gun",
+                "knife",
+                "scissor",
+                "scissors",
+                "pistol",
+                "rifle",
+                "firearm",
+                "handgun",
+                "kitchen_knife",
+                "shotgun",
+            ],
             "fire": ["fire", "flame"],
             "smoke": ["smoke"],
             "person": ["person"],
@@ -42,11 +68,29 @@ class Settings(BaseSettings):
     )
     inference_fps: float = Field(default=5.0, validation_alias=AliasChoices("AI_INFERENCE_FPS"))
     confidence_threshold: float = Field(default=0.55, ge=0, le=1, validation_alias=AliasChoices("AI_CONFIDENCE_THRESHOLD"))
+    person_confidence_threshold: float = Field(
+        default=0.35, ge=0, le=1, validation_alias=AliasChoices("AI_PERSON_CONFIDENCE_THRESHOLD")
+    )
+    weapon_confidence_threshold: float = Field(
+        default=0.25, ge=0, le=1, validation_alias=AliasChoices("AI_WEAPON_CONFIDENCE_THRESHOLD")
+    )
+    fire_confidence_threshold: float = Field(
+        default=0.25, ge=0, le=1, validation_alias=AliasChoices("AI_FIRE_CONFIDENCE_THRESHOLD")
+    )
+    smoke_confidence_threshold: float = Field(
+        default=0.05, ge=0, le=1, validation_alias=AliasChoices("AI_SMOKE_CONFIDENCE_THRESHOLD")
+    )
     recognition_match_threshold: float = Field(
         default=0.82,
         ge=0,
         le=1,
         validation_alias=AliasChoices("AI_RECOGNITION_MATCH_THRESHOLD"),
+    )
+    recognition_min_margin: float = Field(
+        default=0.08,
+        ge=0,
+        le=1,
+        validation_alias=AliasChoices("AI_RECOGNITION_MIN_MARGIN"),
     )
     recognition_embedding_dimensions: int = Field(
         default=16,
@@ -91,11 +135,42 @@ class Settings(BaseSettings):
     def normalize_backend_name(cls, value: str) -> str:
         return value.strip().lower().replace("-", "_")
 
+    @field_validator(
+        "model_weights_path",
+        "model_person_weapon_weights_path",
+        "model_weapon_weights_path",
+        "model_fire_smoke_weights_path",
+        mode="before",
+    )
+    @classmethod
+    def normalize_optional_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        candidate = Path(normalized)
+        if candidate.is_absolute():
+            return str(candidate)
+        if (PROJECT_ROOT / candidate).exists():
+            return str((PROJECT_ROOT / candidate).resolve())
+        if (PROJECT_ROOT / "storage" / "models" / candidate).exists():
+            return str((PROJECT_ROOT / "storage" / "models" / candidate).resolve())
+        if candidate.parent == Path("."):
+            for search_dir in (PROJECT_ROOT, PROJECT_ROOT / "storage" / "models"):
+                if (search_dir / candidate).exists():
+                    return str((search_dir / candidate).resolve())
+        return normalized
+
     @field_validator("model_label_aliases", mode="before")
     @classmethod
     def normalize_label_aliases(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
         return {
-            detector.strip().lower(): [alias.strip().lower() for alias in aliases if alias.strip()]
+            detector.strip().lower().replace("-", "_").replace(" ", "_"): [
+                alias.strip().lower().replace("-", "_").replace(" ", "_")
+                for alias in aliases
+                if alias.strip()
+            ]
             for detector, aliases in value.items()
         }
 
@@ -114,6 +189,45 @@ class Settings(BaseSettings):
             if len(parts) == 2:
                 return int(parts[0]), int(parts[1])
         return value
+
+    @model_validator(mode="after")
+    def validate_production_runtime(self) -> "Settings":
+        if self.environment.strip().lower() != "production":
+            return self
+
+        if self.model_backend == "simulated":
+            raise ValueError("Production mode does not allow the simulated inference backend.")
+        if self.allow_backend_fallback:
+            raise ValueError("Production mode requires AI_ALLOW_BACKEND_FALLBACK=false.")
+        if self.recognition_backend != "insightface":
+            raise ValueError("Production mode requires AI_RECOGNITION_BACKEND=insightface.")
+        if self.recognition_allow_fallback:
+            raise ValueError("Production mode requires AI_RECOGNITION_ALLOW_FALLBACK=false.")
+
+        required_paths = {
+            "AI_MODEL_WEIGHTS_PATH": self.model_weights_path,
+            "AI_MODEL_WEAPON_WEIGHTS_PATH": self.model_weapon_weights_path,
+            "AI_MODEL_FIRE_SMOKE_WEIGHTS_PATH": self.model_fire_smoke_weights_path,
+        }
+        for env_name, candidate in required_paths.items():
+            if not candidate:
+                raise ValueError(f"Production mode requires {env_name} to point to a trained checkpoint.")
+            if not Path(candidate).exists():
+                raise ValueError(f"{env_name} points to a missing file: {candidate}")
+
+        optional_paths = {
+            "AI_MODEL_PERSON_WEAPON_WEIGHTS_PATH": self.model_person_weapon_weights_path,
+        }
+        for env_name, candidate in optional_paths.items():
+            if candidate and not Path(candidate).exists():
+                raise ValueError(f"{env_name} points to a missing file: {candidate}")
+
+        if not self.api_event_callback_url:
+            raise ValueError("Production mode requires AI_API_EVENT_CALLBACK_URL.")
+        if not self.api_event_callback_token:
+            raise ValueError("Production mode requires AI_API_EVENT_CALLBACK_TOKEN.")
+
+        return self
 
 
 @lru_cache

@@ -56,6 +56,7 @@ class InferenceBox(BaseModel):
     y2: float = Field(ge=0)
     confidence: float = Field(ge=0, le=1)
     label: str = Field(min_length=1, max_length=64)
+    object_label: str | None = Field(default=None, max_length=64)
     track_id: str | None = Field(default=None, max_length=64)
     face_region: FaceRegion | None = None
     recognition: InferenceRecognition | None = None
@@ -69,7 +70,7 @@ class InferenceRequest(BaseModel):
     frame_content_base64: str | None = None
     frame_content_type: str | None = Field(default=None, max_length=120)
     include_evidence: bool = False
-    requested_detectors: list[str] = Field(default_factory=lambda: ["weapon", "fire", "smoke", "person"])
+    requested_detectors: list[str] = Field(default_factory=lambda: ["weapon", "person"])
     recognition_enabled: bool = False
     known_persons: list[KnownPersonProfile] = Field(default_factory=list)
     occurrence_hint: str | None = Field(default=None, max_length=64)

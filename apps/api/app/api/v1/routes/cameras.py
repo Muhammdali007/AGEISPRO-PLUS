@@ -14,11 +14,14 @@ from app.schemas.cameras import (
     CameraConnectionBatch,
     CameraConnectionTest,
     CameraCreate,
+    CameraDetectionScanRequest,
+    CameraDetectionScanResponse,
     CameraLiveMonitorResponse,
     CameraRead,
     CameraStreamDescriptor,
     CameraUpdate,
 )
+from app.services.camera_detection import CameraDetectionService
 from app.services.camera_streams import CameraStreamingService
 from app.services.audit_logs import AuditLogService
 
@@ -33,6 +36,12 @@ def get_camera_streaming_service(
     cameras: CameraRepository = Depends(get_camera_repository),
 ) -> CameraStreamingService:
     return CameraStreamingService(cameras)
+
+
+def get_camera_detection_service(
+    session: AsyncSession = Depends(get_db),
+) -> CameraDetectionService:
+    return CameraDetectionService(session)
 
 
 @router.get("", response_model=list[CameraRead], response_model_by_alias=False)
@@ -163,6 +172,29 @@ async def test_camera_connection(
         resource_type="camera",
         resource_id=str(camera.id),
         metadata={"status": result.status.value, "latency_ms": result.latency_ms},
+    )
+    return result
+
+
+@router.post("/{camera_id}/scan", response_model=CameraDetectionScanResponse)
+async def run_camera_scan(
+    camera_id: UUID,
+    payload: CameraDetectionScanRequest,
+    current_user: User = Depends(require_roles(UserRole.administrator, UserRole.supervisor, UserRole.operator)),
+    events: CameraDetectionService = Depends(get_camera_detection_service),
+) -> CameraDetectionScanResponse:
+    result = await events.run_scan(camera_id, payload)
+    await AuditLogService(AuditLogRepository(events.session)).record(
+        actor=current_user,
+        action="cameras.scan",
+        resource_type="camera",
+        resource_id=str(camera_id),
+        metadata={
+            "detection_count": result.detection_count,
+            "incident_count": result.incident_count,
+            "alert_count": result.alert_count,
+            "backend": result.backend,
+        },
     )
     return result
 

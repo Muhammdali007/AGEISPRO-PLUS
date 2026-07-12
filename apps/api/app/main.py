@@ -8,6 +8,7 @@ from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.logging import configure_logging
 from app.db.bootstrap import bootstrap_database
+from app.services.continuous_detection import continuous_detection_worker
 
 
 @asynccontextmanager
@@ -15,7 +16,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     configure_logging()
     if settings.auto_create_tables:
         await bootstrap_database()
+    if settings.continuous_detection_enabled and settings.environment != "test":
+        continuous_detection_worker.start()
     yield
+    await continuous_detection_worker.stop()
 
 
 app = FastAPI(

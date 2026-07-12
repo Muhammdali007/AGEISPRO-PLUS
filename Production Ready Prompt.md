@@ -878,7 +878,7 @@ Reports
 Camera health
 GPU metrics
 System health
-Audit logs
+Audit logsy
 
 Deliverable: Operational monitoring dashboard.
 

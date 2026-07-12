@@ -93,6 +93,10 @@ export type CameraCreateInput = {
   metadata?: Record<string, unknown>;
 };
 
+export type CameraUpdateInput = Partial<CameraCreateInput> & {
+  status?: CameraStatus;
+};
+
 export type CameraConnectionTest = {
   camera_id: string;
   status: CameraStatus;
@@ -142,6 +146,48 @@ export type CameraLiveMonitorResponse = {
 
 export type CameraConnectionBatch = {
   results: CameraConnectionTest[];
+};
+
+export type CameraDetectionScanRequest = {
+  frame_content_base64?: string;
+  frame_content_type?: string;
+  include_evidence?: boolean;
+  requested_detectors?: string[];
+  recognition_enabled?: boolean;
+  occurrence_hint?: string;
+};
+
+export type CameraDetectionScanSummary = {
+  detection_type: string;
+  confidence: number;
+  track_id: string | null;
+  recognition_status: string | null;
+  identity_label: string | null;
+  bounding_box: DetectionOverlayBox | null;
+  face_bounding_box: DetectionOverlayBox | null;
+  metadata: Record<string, unknown>;
+};
+
+export type DetectionOverlayBox = {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  label?: string | null;
+};
+
+export type CameraDetectionScanResponse = {
+  camera_id: string;
+  model_name: string;
+  model_version: string;
+  detection_count: number;
+  incident_count: number;
+  alert_count: number;
+  ignored_count: number;
+  detections: CameraDetectionScanSummary[];
+  ignored_reasons: string[];
+  backend: string | null;
+  callback_delivered: boolean;
 };
 
 export type Incident = {
@@ -343,6 +389,59 @@ export type SystemHealthReport = {
   ai: AiRuntimeHealth;
 };
 
+export type OptimizationResourceSnapshot = {
+  incidents_total: number;
+  incidents_last_24h: number;
+  active_alerts_total: number;
+  alerts_last_24h: number;
+  audit_logs_total: number;
+  audit_logs_last_24h: number;
+};
+
+export type DatabaseOptimizationReport = {
+  status: string;
+  pool_size: number;
+  max_overflow: number;
+  pool_recycle_seconds: number;
+  indexed_paths: string[];
+  resources: OptimizationResourceSnapshot;
+  detail: string | null;
+};
+
+export type RedisOptimizationReport = {
+  status: string;
+  ping_ms: number | null;
+  used_memory_human: string | null;
+  connected_clients: number | null;
+  pubsub_channels: number | null;
+  detail: string | null;
+};
+
+export type RuntimeOptimizationReport = {
+  status: string;
+  inference_backend: string | null;
+  recognition_backend: string | null;
+  gpu_available: boolean;
+  gpu_utilization_percent: number | null;
+  gpu_memory_used_mb: number | null;
+  gpu_memory_total_mb: number | null;
+  detail: string | null;
+};
+
+export type OptimizationRecommendation = {
+  title: string;
+  detail: string;
+  severity: "info" | "warning" | "critical";
+};
+
+export type OptimizationReport = {
+  generated_at: string;
+  database: DatabaseOptimizationReport;
+  redis: RedisOptimizationReport;
+  runtime: RuntimeOptimizationReport;
+  recommendations: OptimizationRecommendation[];
+};
+
 export type MonitoringOverview = {
   window: MonitoringWindow;
   generated_at: string;
@@ -514,6 +613,21 @@ export async function getCamera(accessToken: string, cameraId: string) {
   return apiFetch<Camera>(`/api/v1/cameras/${cameraId}`, { token: accessToken });
 }
 
+export async function updateCamera(accessToken: string, cameraId: string, payload: CameraUpdateInput) {
+  return apiFetch<Camera>(`/api/v1/cameras/${cameraId}`, {
+    method: "PATCH",
+    token: accessToken,
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function deleteCamera(accessToken: string, cameraId: string) {
+  return apiFetch<void>(`/api/v1/cameras/${cameraId}`, {
+    method: "DELETE",
+    token: accessToken
+  });
+}
+
 export async function getCameraStream(accessToken: string, cameraId: string) {
   return apiFetch<CameraStreamDescriptor>(`/api/v1/cameras/${cameraId}/stream`, { token: accessToken });
 }
@@ -522,6 +636,23 @@ export async function testCameraConnection(accessToken: string, cameraId: string
   return apiFetch<CameraConnectionTest>(`/api/v1/cameras/${cameraId}/test-connection`, {
     method: "POST",
     token: accessToken
+  });
+}
+
+export async function runCameraDetectionScan(
+  accessToken: string,
+  cameraId: string,
+  payload: CameraDetectionScanRequest = {}
+) {
+  return apiFetch<CameraDetectionScanResponse>(`/api/v1/cameras/${cameraId}/scan`, {
+    method: "POST",
+    token: accessToken,
+    body: JSON.stringify({
+      include_evidence: true,
+      recognition_enabled: true,
+      requested_detectors: ["weapon", "person", "fire", "smoke"],
+      ...payload
+    })
   });
 }
 
@@ -620,6 +751,12 @@ export async function getCameraHealthReport(accessToken: string) {
 
 export async function getSystemHealthReport(accessToken: string) {
   return apiFetch<SystemHealthReport>("/api/v1/monitoring/system-health", {
+    token: accessToken
+  });
+}
+
+export async function getOptimizationReport(accessToken: string) {
+  return apiFetch<OptimizationReport>("/api/v1/monitoring/optimization", {
     token: accessToken
   });
 }

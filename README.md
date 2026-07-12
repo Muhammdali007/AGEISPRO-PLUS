@@ -81,6 +81,24 @@ Phase 8 adds operational monitoring:
 - AI runtime telemetry for inference backend and best-effort GPU visibility.
 - A real analytics dashboard that replaces the earlier placeholder route.
 
+Phase 9 adds production hardening:
+
+- Database-backed aggregation for monitoring KPI calculations instead of
+  Python-side full-table filtering.
+- Configurable database connection pool tuning and recycle controls.
+- Composite indexes for monitoring, alert, camera, and audit-log hot paths.
+- A dashboard-visible optimization report covering Redis latency, row volumes,
+  and AI runtime capacity signals.
+
+Phase 10 adds production deployment:
+
+- HTTPS Nginx ingress with security headers, request limits, WebSocket proxying,
+  and internal-only application services.
+- A production Compose overlay with Gunicorn, health checks, bounded log
+  rotation, Prometheus exporters, HTTP probes, and Grafana.
+- Checksum-verified PostgreSQL and evidence backup/restore tooling.
+- A deployment, certificate renewal, monitoring, rollback, and recovery runbook.
+
 ## Project Layout
 
 ```text
@@ -160,6 +178,21 @@ AI_RECOGNITION_ALLOW_FALLBACK=false
 API_RECOGNITION_ALLOW_FALLBACK=false
 ```
 
+## Production deployment
+
+The repo now includes a root [`.env.production`](C:/Users/Hp/Desktop/AegisPro/.env.production) for the Docker stack and a
+template at [`.env.production.example`](C:/Users/Hp/Desktop/AegisPro/.env.production.example).
+
+- `docker-compose.yml` now starts `postgres`, `redis`, `api`, `ai`, `web`, and `nginx`.
+- The API container runs `alembic upgrade head` before serving traffic.
+- Nginx proxies `/backend/*` directly to the API so browser calls and websocket events work behind one origin.
+- Production mode now fails fast if simulated inference, hash recognition, fallback backends, default secrets, or a missing weapon checkpoint are configured.
+
+Important:
+- Real knife or weapon detection requires a trained checkpoint at `AI_MODEL_WEAPON_WEIGHTS_PATH`.
+- The current repository contains `storage/models/yolo11n.pt`, but that is not a dedicated weapon model.
+- Until you place a real weapon checkpoint at the configured path, the production AI service will refuse to start.
+
 The default `CPUExecutionProvider` works for local CPU inference. In production,
 you can swap the ONNX Runtime provider list and model settings to match your GPU
 or deployment target.
@@ -200,7 +233,7 @@ npm test
 
 ## Phase Boundary
 
-Phase 8 is now the implemented boundary. The platform ships with:
+Phase 10 is now the implemented boundary. The platform ships with:
 
 - A development-safe default and an opt-in production-grade recognition path.
 - Storage-backed incident evidence capture and protected retrieval routes.
@@ -209,8 +242,18 @@ Phase 8 is now the implemented boundary. The platform ships with:
 - Authenticated websocket notifications for incident and alert lifecycle events.
 - Monitoring APIs for incident trends, camera health, system readiness, AI
   runtime telemetry, and audit activity.
-- A Phase 8 operational dashboard that replaces the earlier analytics
-  placeholders.
+- A Phase 9 optimization dashboard that layers database, Redis, and runtime
+  hardening telemetry on top of the operational monitoring experience.
+- Database-side monitoring aggregates, connection-pool tuning, and composite
+  indexing for production-readiness work.
+- A hardened production ingress, private service network, operational
+  monitoring, bounded logs, and a documented backup/restore strategy.
 
 Documentation for earlier phases remains useful for architecture context, but
-Phase 8 is the current end-to-end operational baseline.
+Phase 10 is the current end-to-end production deployment baseline. See
+[`docs/phase-10-production-deployment.md`](docs/phase-10-production-deployment.md)
+for the deployment and operations runbook.
+
+Model roles, continuous camera processing, deduplication, checkpoint requirements, and current
+validation limits are documented in
+[`docs/detection-runtime.md`](docs/detection-runtime.md).

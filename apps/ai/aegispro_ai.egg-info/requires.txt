@@ -1,0 +1,16 @@
+fastapi>=0.115.0
+pillow>=10.4.0
+pydantic-settings>=2.4.0
+uvicorn[standard]>=0.30.6
+
+[dev]
+pytest>=8.3.2
+ruff>=0.6.2
+
+[model]
+ultralytics>=8.3.0
+
+[recognition]
+insightface>=0.7.3
+numpy>=1.26.4
+onnxruntime>=1.18.1

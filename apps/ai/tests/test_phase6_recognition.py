@@ -154,6 +154,49 @@ def test_recognition_uses_image_embedding_backend_when_frame_is_available(monkey
     assert result.detections[0].recognition.metadata["backend"] == "insightface"
 
 
+def test_recognition_recomputes_real_frames_when_tracker_id_is_reused(monkeypatch) -> None:
+    vectors = iter(([0.5] * 16, [-0.5] * 16))
+
+    class ChangingBackend:
+        def extract_embedding(self, image_bytes: bytes) -> FaceEmbeddingResult:
+            return FaceEmbeddingResult(
+                vector=next(vectors),
+                model_name="insightface-buffalo_l",
+                backend_name="insightface",
+                metadata={"backend": "insightface"},
+            )
+
+    monkeypatch.setattr(FaceRecognitionService, "_build_backend", staticmethod(lambda: ChangingBackend()))
+    request = build_request("reused-track").model_copy(
+        update={
+            "frame_content_base64": build_frame_base64(),
+            "frame_content_type": "image/jpeg",
+            "known_persons": [
+                KnownPersonProfile(
+                    person_id=uuid4(),
+                    full_name="Muhammad Ali",
+                    person_type="student",
+                    face_profiles=[
+                        KnownPersonFaceProfile(
+                            face_id="front",
+                            embedding_vector=[0.5] * 16,
+                            embedding_model="insightface-buffalo_l",
+                        )
+                    ],
+                )
+            ],
+        }
+    )
+    pipeline = InferencePipeline()
+
+    first = pipeline.run(request).detections[0].recognition
+    second = pipeline.run(request).detections[0].recognition
+
+    assert first is not None and first.status == "known"
+    assert second is not None and second.status == "unknown"
+    assert second.deduplicated is False
+
+
 def test_dispatch_payload_includes_recognition_metadata(monkeypatch) -> None:
     captured: dict[str, object] = {}
     pipeline = InferencePipeline()

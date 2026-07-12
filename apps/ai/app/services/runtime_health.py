@@ -1,5 +1,6 @@
 import csv
 import subprocess
+from pathlib import Path
 
 from app.core.config import settings
 
@@ -54,4 +55,28 @@ def collect_runtime_health() -> dict[str, object]:
         "gpu_utilization_percent": gpu_utilization_percent,
         "telemetry_supported": telemetry_supported,
         "detail": detail,
+        "models": {
+            "person": _model_status(
+                settings.model_person_weapon_weights_path or settings.model_weights_path
+            ),
+            "weapon": _model_status(settings.model_weapon_weights_path),
+            "fire_smoke": _model_status(settings.model_fire_smoke_weights_path),
+        },
+        "confidence_thresholds": {
+            "person": settings.person_confidence_threshold,
+            "weapon": settings.weapon_confidence_threshold,
+            "fire": settings.fire_confidence_threshold,
+            "smoke": settings.smoke_confidence_threshold,
+        },
+    }
+
+
+def _model_status(path: str | None) -> dict[str, object]:
+    candidate = Path(path) if path else None
+    exists = bool(candidate and candidate.is_file())
+    return {
+        "path": str(candidate) if candidate else None,
+        "configured": candidate is not None,
+        "exists": exists,
+        "size_bytes": candidate.stat().st_size if candidate and exists else None,
     }

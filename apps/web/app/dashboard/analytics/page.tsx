@@ -7,6 +7,7 @@ import { EmptyState, MetricCard, SectionCard } from "@/components/dashboard-ui";
 import {
   getCameraHealthReport,
   getMonitoringOverview,
+  getOptimizationReport,
   getSystemHealthReport,
   listAuditLogs,
   type CameraHealthEntry,
@@ -39,6 +40,11 @@ export default function AnalyticsPage() {
     queryFn: () => getSystemHealthReport(accessToken!),
     enabled: Boolean(accessToken)
   });
+  const optimizationQuery = useQuery({
+    queryKey: ["monitoring", "optimization", accessToken],
+    queryFn: () => getOptimizationReport(accessToken!),
+    enabled: Boolean(accessToken)
+  });
   const auditLogsQuery = useQuery({
     queryKey: ["monitoring", "audit-logs", accessToken, actionFilter, resourceTypeFilter],
     queryFn: () =>
@@ -53,6 +59,7 @@ export default function AnalyticsPage() {
   const overview = overviewQuery.data;
   const cameraHealth = cameraHealthQuery.data;
   const systemHealth = systemHealthQuery.data ?? overview?.system_health;
+  const optimization = optimizationQuery.data;
   const auditPage = auditLogsQuery.data;
 
   if (!accessToken) {
@@ -68,6 +75,7 @@ export default function AnalyticsPage() {
     overviewQuery.error instanceof Error ||
     cameraHealthQuery.error instanceof Error ||
     systemHealthQuery.error instanceof Error ||
+    optimizationQuery.error instanceof Error ||
     auditLogsQuery.error instanceof Error
   ) {
     return (
@@ -80,6 +88,8 @@ export default function AnalyticsPage() {
               ? cameraHealthQuery.error.message
               : systemHealthQuery.error instanceof Error
                 ? systemHealthQuery.error.message
+                : optimizationQuery.error instanceof Error
+                  ? optimizationQuery.error.message
                 : auditLogsQuery.error instanceof Error
                   ? auditLogsQuery.error.message
                   : "Unable to load monitoring data."
@@ -88,11 +98,11 @@ export default function AnalyticsPage() {
     );
   }
 
-  if (!overview || !cameraHealth || !systemHealth || !auditPage) {
+  if (!overview || !cameraHealth || !systemHealth || !optimization || !auditPage) {
     return (
       <EmptyState
-        title="Preparing operational monitoring"
-        description="Collecting incident trends, camera telemetry, service readiness, and audit history."
+        title="Preparing optimization telemetry"
+        description="Collecting incident trends, camera telemetry, runtime health, cache performance, and audit history."
       />
     );
   }
@@ -104,10 +114,10 @@ export default function AnalyticsPage() {
     <div className="space-y-6">
       <section className="flex flex-wrap items-center justify-between gap-3 rounded-[24px] border border-white/10 bg-panel/60 px-4 py-4">
         <div>
-          <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Phase 8</p>
-          <h2 className="mt-1 text-xl font-semibold">Operational monitoring</h2>
+          <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Phase 9</p>
+          <h2 className="mt-1 text-xl font-semibold">Operational monitoring and optimization</h2>
           <p className="mt-1 text-sm text-slate-400">
-            Incident trends, camera health, service readiness, and operator audit activity.
+            Incident trends, camera health, service readiness, cache telemetry, and production hardening signals.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -127,6 +137,30 @@ export default function AnalyticsPage() {
             </button>
           ))}
         </div>
+      </section>
+
+      <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <MetricCard
+          label="DB pool"
+          value={`${optimization.database.pool_size}+${optimization.database.max_overflow}`}
+          detail={`Recycle every ${optimization.database.pool_recycle_seconds}s.`}
+        />
+        <MetricCard
+          label="Redis latency"
+          value={optimization.redis.ping_ms !== null ? `${optimization.redis.ping_ms} ms` : "Unavailable"}
+          detail={optimization.redis.used_memory_human ? `Memory in use: ${optimization.redis.used_memory_human}` : "Redis memory not reported."}
+          tone={optimization.redis.status === "ok" ? "success" : "alert"}
+        />
+        <MetricCard
+          label="24h incident load"
+          value={`${optimization.database.resources.incidents_last_24h}`}
+          detail={`${optimization.database.resources.incidents_total} incidents persisted overall.`}
+        />
+        <MetricCard
+          label="Audit trail volume"
+          value={`${optimization.database.resources.audit_logs_last_24h}`}
+          detail={`${optimization.database.resources.audit_logs_total} audit events stored overall.`}
+        />
       </section>
 
       <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
@@ -255,6 +289,47 @@ export default function AnalyticsPage() {
                 value={systemHealth.ai.recognition_providers.length ? systemHealth.ai.recognition_providers.join(", ") : "Not reported"}
               />
             </div>
+          </div>
+        </SectionCard>
+      </div>
+
+      <div className="grid gap-6 xl:grid-cols-[1.1fr_0.9fr]">
+        <SectionCard
+          title="Optimization report"
+          description="Phase 9 hardening telemetry for database, Redis, and AI runtime behavior."
+        >
+          <div className="grid gap-4 md:grid-cols-2">
+            <TelemetryCell label="Indexed paths" value={`${optimization.database.indexed_paths.length}`} />
+            <TelemetryCell label="Redis clients" value={`${optimization.redis.connected_clients ?? 0}`} />
+            <TelemetryCell label="Pub/Sub channels" value={`${optimization.redis.pubsub_channels ?? 0}`} />
+            <TelemetryCell
+              label="GPU utilization"
+              value={
+                optimization.runtime.gpu_utilization_percent !== null
+                  ? `${optimization.runtime.gpu_utilization_percent}%`
+                  : "Not reported"
+              }
+            />
+          </div>
+          <p className="mt-4 text-sm text-slate-400">{optimization.database.detail}</p>
+        </SectionCard>
+
+        <SectionCard
+          title="Optimization recommendations"
+          description="Actionable follow-ups surfaced from current production-readiness telemetry."
+        >
+          <div className="space-y-3">
+            {optimization.recommendations.map((recommendation) => (
+              <div key={recommendation.title} className="rounded-[20px] border border-white/10 bg-black/15 px-4 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="font-medium text-slate-100">{recommendation.title}</p>
+                  <span className={cn("rounded-full px-2.5 py-1 text-xs font-medium", statusTone(recommendation.severity))}>
+                    {labelize(recommendation.severity)}
+                  </span>
+                </div>
+                <p className="mt-2 text-sm text-slate-400">{recommendation.detail}</p>
+              </div>
+            ))}
           </div>
         </SectionCard>
       </div>

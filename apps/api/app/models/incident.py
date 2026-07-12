@@ -3,7 +3,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey, JSON, Text, Uuid
+from sqlalchemy import DateTime, Enum, Float, ForeignKey, Index, JSON, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -36,6 +36,10 @@ class IncidentStatus(StrEnum):
 
 class Incident(Base):
     __tablename__ = "incidents"
+    __table_args__ = (
+        Index("ix_incidents_occurred_at_detection_type", "occurred_at", "detection_type"),
+        Index("ix_incidents_status_occurred_at", "status", "occurred_at"),
+    )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
     camera_id: Mapped[UUID] = mapped_column(

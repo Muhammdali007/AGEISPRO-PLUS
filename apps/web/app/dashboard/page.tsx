@@ -173,8 +173,8 @@ export default function DashboardOverviewPage() {
 
         <SectionCard
           title="Alert feed"
-          description="Active alert volume and escalation status remain visible alongside the Phase 8 monitoring stack."
-          action={<InlineLink href="/dashboard/analytics" label="Open operational monitoring" />}
+          description="Active alert volume and escalation status remain visible alongside the Phase 9 monitoring and optimization stack."
+          action={<InlineLink href="/dashboard/analytics" label="Open optimization dashboard" />}
         >
           {hotAlerts.length === 0 ? (
             <EmptyState

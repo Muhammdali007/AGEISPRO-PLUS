@@ -79,7 +79,7 @@ class InferencePipeline:
                             "y1": detection.y1,
                             "x2": detection.x2,
                             "y2": detection.y2,
-                            "label": detection.label,
+                            "label": detection.object_label or detection.label,
                         }
                         if detection.label
                         else None,

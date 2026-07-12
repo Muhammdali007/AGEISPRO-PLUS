@@ -71,3 +71,10 @@ class AuditLogRepository:
         items = list(await self.session.scalars(query))
         total = int((await self.session.execute(total_query)).scalar_one())
         return items, total
+
+    async def count_all(self) -> int:
+        return int((await self.session.execute(select(func.count()).select_from(AuditLog))).scalar_one())
+
+    async def count_since(self, date_from: datetime) -> int:
+        query = select(func.count()).select_from(AuditLog).where(AuditLog.created_at >= date_from)
+        return int((await self.session.execute(query)).scalar_one())

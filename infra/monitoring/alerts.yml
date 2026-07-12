@@ -1,0 +1,34 @@
+groups:
+  - name: aegispro-infrastructure
+    rules:
+      - alert: PostgreSQLExporterDown
+        expr: up{job="postgres"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: PostgreSQL monitoring target is unavailable
+
+      - alert: RedisExporterDown
+        expr: up{job="redis"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Redis monitoring target is unavailable
+
+      - alert: PostgreSQLConnectionsHigh
+        expr: sum(pg_stat_activity_count) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: PostgreSQL connection usage is high
+
+      - alert: RedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Redis is using more than 85% of its configured memory

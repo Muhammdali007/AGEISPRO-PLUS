@@ -22,7 +22,7 @@ test("allows an administrator to sign in and navigate the main dashboard routes"
   await loginViaUi(page);
 
   await expect(page.getByRole("heading", { name: "Live operations workspace" })).toBeVisible();
-  await expect(page.getByText("Phase 8 monitoring", { exact: true })).toBeVisible();
+  await expect(page.getByText("Phase 9 optimization", { exact: true })).toBeVisible();
 
   await page.getByRole("link", { name: /Cameras/i }).click();
   await expect(page).toHaveURL(/\/dashboard\/cameras$/);
@@ -41,16 +41,17 @@ test("allows an administrator to sign in and navigate the main dashboard routes"
   await expect(page.getByText("User management")).toBeVisible();
 });
 
-test("loads the phase 8 analytics dashboard with operational monitoring data", async ({ page }) => {
+test("loads the phase 9 analytics dashboard with optimization telemetry", async ({ page }) => {
   await loginViaUi(page);
 
   await page.goto("/dashboard/analytics");
 
-  await expect(page.getByText("Operational monitoring")).toBeVisible();
+  await expect(page.getByText("Operational monitoring and optimization")).toBeVisible();
   await expect(page.getByText("Incident volume")).toBeVisible();
   await expect(page.getByText("Detection mix")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Camera health" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "System health" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Optimization report" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Recent audit log" })).toBeVisible();
   await expect(page.getByText("alerts.clear")).toBeVisible();
 });
@@ -390,6 +391,57 @@ async function stubBackend(page: Page) {
           telemetry_supported: false,
           detail: "CUDA is not available on this host."
         }
+      });
+      return;
+    }
+
+    if (path === "/api/v1/monitoring/optimization") {
+      await fulfillJson(route, {
+        generated_at: "2026-07-07T12:00:00Z",
+        database: {
+          status: "ok",
+          pool_size: 10,
+          max_overflow: 20,
+          pool_recycle_seconds: 1800,
+          indexed_paths: [
+            "incidents(occurred_at, detection_type)",
+            "alerts(status, created_at)"
+          ],
+          resources: {
+            incidents_total: 240,
+            incidents_last_24h: 8,
+            active_alerts_total: 2,
+            alerts_last_24h: 4,
+            audit_logs_total: 920,
+            audit_logs_last_24h: 24
+          },
+          detail: "Monitoring aggregates are computed through filtered SQL queries to reduce Python-side memory pressure."
+        },
+        redis: {
+          status: "ok",
+          ping_ms: 3.2,
+          used_memory_human: "1.21M",
+          connected_clients: 4,
+          pubsub_channels: 2,
+          detail: "Redis health verified with a live ping and INFO sampling."
+        },
+        runtime: {
+          status: "ok",
+          inference_backend: "ultralytics",
+          recognition_backend: "hash",
+          gpu_available: false,
+          gpu_utilization_percent: null,
+          gpu_memory_used_mb: null,
+          gpu_memory_total_mb: null,
+          detail: "CUDA is not available on this host."
+        },
+        recommendations: [
+          {
+            title: "Database-side aggregation",
+            detail: "Phase 9 monitoring now aggregates incidents and alerts in SQL before shaping dashboard responses.",
+            severity: "info"
+          }
+        ]
       });
       return;
     }
