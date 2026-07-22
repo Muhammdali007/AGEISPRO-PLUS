@@ -6,6 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_roles
+from app.db.transactions import transaction_scope
 from app.db.session import get_db
 from app.models.person import Person
 from app.models.user import User, UserRole
@@ -63,20 +64,21 @@ async def match_person_embeddings(
 @router.post("", response_model=PersonRead, response_model_by_alias=False, status_code=status.HTTP_201_CREATED)
 async def create_person(
     payload: PersonCreate,
-    current_user: User = Depends(require_roles(UserRole.administrator, UserRole.supervisor, UserRole.operator)),
+    current_user: User = Depends(require_roles(UserRole.administrator, UserRole.supervisor)),
     persons: PersonService = Depends(get_person_service),
 ) -> Person:
     try:
-        person = await persons.create(payload)
+        async with transaction_scope(persons.repository.session):
+            person = await persons.create(payload)
+            await AuditLogService(AuditLogRepository(persons.repository.session)).record(
+                actor=current_user,
+                action="persons.create",
+                resource_type="person",
+                resource_id=str(person.id),
+                metadata={"reference_id": person.reference_id, "person_type": person.person_type},
+            )
     except IntegrityError:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Reference ID already exists")
-    await AuditLogService(AuditLogRepository(persons.repository.session)).record(
-        actor=current_user,
-        action="persons.create",
-        resource_type="person",
-        resource_id=str(person.id),
-        metadata={"reference_id": person.reference_id, "person_type": person.person_type},
-    )
     return person
 
 
@@ -100,30 +102,58 @@ async def get_person(
 async def update_person(
     person_id: UUID,
     payload: PersonUpdate,
-    _: User = Depends(require_roles(UserRole.administrator, UserRole.supervisor, UserRole.operator)),
+    current_user: User = Depends(require_roles(UserRole.administrator, UserRole.supervisor)),
     persons: PersonService = Depends(get_person_service),
 ) -> Person:
     try:
-        return await persons.update(person_id, payload)
+        async with transaction_scope(persons.repository.session):
+            person = await persons.update(person_id, payload)
+            await AuditLogService(AuditLogRepository(persons.repository.session)).record(
+                actor=current_user,
+                action="persons.update",
+                resource_type="person",
+                resource_id=str(person.id),
+                metadata=payload.model_dump(exclude_unset=True),
+            )
     except IntegrityError:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Reference ID already exists")
+    return person
+
+
+@router.delete("/{person_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_person(
+    person_id: UUID,
+    current_user: User = Depends(require_roles(UserRole.administrator, UserRole.supervisor)),
+    persons: PersonService = Depends(get_person_service),
+) -> None:
+    person = await persons.get_or_404(person_id)
+    async with transaction_scope(persons.repository.session):
+        await AuditLogService(AuditLogRepository(persons.repository.session)).record(
+            actor=current_user,
+            action="persons.delete",
+            resource_type="person",
+            resource_id=str(person.id),
+            metadata={"reference_id": person.reference_id, "full_name": person.full_name},
+        )
+        await persons.delete(person_id)
 
 
 @router.post("/{person_id}/faces", response_model=PersonRead, response_model_by_alias=False)
 async def enroll_person_face(
     person_id: UUID,
     payload: PersonFaceEnrollment,
-    current_user: User = Depends(require_roles(UserRole.administrator, UserRole.supervisor, UserRole.operator)),
+    current_user: User = Depends(require_roles(UserRole.administrator, UserRole.supervisor)),
     persons: PersonService = Depends(get_person_service),
 ) -> Person:
-    person = await persons.enroll_face(person_id, payload)
-    await AuditLogService(AuditLogRepository(persons.repository.session)).record(
-        actor=current_user,
-        action="persons.face_enroll",
-        resource_type="person",
-        resource_id=str(person.id),
-        metadata={"face_count": person.face_image_count},
-    )
+    async with transaction_scope(persons.repository.session):
+        person = await persons.enroll_face(person_id, payload)
+        await AuditLogService(AuditLogRepository(persons.repository.session)).record(
+            actor=current_user,
+            action="persons.face_enroll",
+            resource_type="person",
+            resource_id=str(person.id),
+            metadata={"face_count": person.face_image_count},
+        )
     return person
 
 
@@ -132,17 +162,18 @@ async def upload_person_faces(
     person_id: UUID,
     files: list[UploadFile] = File(...),
     is_primary: bool = Form(False),
-    current_user: User = Depends(require_roles(UserRole.administrator, UserRole.supervisor, UserRole.operator)),
+    current_user: User = Depends(require_roles(UserRole.administrator, UserRole.supervisor)),
     persons: PersonService = Depends(get_person_service),
 ) -> Person:
-    person = await persons.enroll_face_images(person_id, files, is_primary=is_primary)
-    await AuditLogService(AuditLogRepository(persons.repository.session)).record(
-        actor=current_user,
-        action="persons.face_enroll",
-        resource_type="person",
-        resource_id=str(person.id),
-        metadata={"face_count": person.face_image_count, "uploaded_files": len(files)},
-    )
+    async with transaction_scope(persons.repository.session):
+        person = await persons.enroll_face_images(person_id, files, is_primary=is_primary)
+        await AuditLogService(AuditLogRepository(persons.repository.session)).record(
+            actor=current_user,
+            action="persons.face_enroll",
+            resource_type="person",
+            resource_id=str(person.id),
+            metadata={"face_count": person.face_image_count, "uploaded_files": len(files)},
+        )
     return person
 
 

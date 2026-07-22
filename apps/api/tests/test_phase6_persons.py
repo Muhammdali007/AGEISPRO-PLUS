@@ -1,9 +1,10 @@
 from collections.abc import AsyncIterator
+from io import BytesIO
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -15,6 +16,7 @@ from app.db.session import get_db
 from app.main import app
 from app.models.camera import CameraSourceType
 from app.models.incident import DetectionType
+from app.models.person import Person
 from app.models.person_face_embedding import PersonFaceEmbedding
 from app.models.user import User, UserRole
 from app.repositories.alerts import AlertRepository
@@ -28,7 +30,8 @@ from app.schemas.incidents import IncidentCreate
 from app.schemas.persons import PersonCreate, PersonFaceEnrollment
 from app.schemas.users import UserCreate
 from app.services.detection_events import DetectionEventService
-from app.services.face_embeddings import FaceEmbeddingError
+from app.services.camera_detection import CameraDetectionService
+from app.services.face_embeddings import FaceEmbeddingError, FaceEmbeddingResult
 from app.services.face_enrollment import FaceEnrollmentService
 from app.services.persons import PersonService
 
@@ -60,6 +63,179 @@ async def client(session: AsyncSession) -> AsyncIterator[AsyncClient]:
 
 async def _set_current_user(user: User) -> None:
     app.dependency_overrides[get_current_user] = lambda: user
+
+
+@pytest.mark.parametrize(
+    ("metadata", "message"),
+    [
+        (
+            {"backend": "insightface", "face_count": 2, "det_score": 0.99, "bbox": [0, 0, 100, 100]},
+            "exactly one visible face",
+        ),
+        (
+            {"backend": "insightface", "face_count": 1, "det_score": 0.40, "bbox": [0, 0, 100, 100]},
+            "confidence is too low",
+        ),
+        (
+            {"backend": "insightface", "face_count": 1, "det_score": 0.99, "bbox": [0, 0, 20, 20]},
+            "too small",
+        ),
+    ],
+)
+def test_face_enrollment_rejects_low_quality_identity_templates(
+    metadata: dict[str, object], message: str
+) -> None:
+    with pytest.raises(HTTPException, match=message):
+        FaceEnrollmentService._validate_enrollment_quality(metadata)
+
+
+def test_face_enrollment_accepts_score_above_runtime_template_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "recognition_enrollment_min_det_score", 0.60)
+    metadata: dict[str, object] = {
+        "backend": "insightface",
+        "face_count": 1,
+        "det_score": 0.69,
+        "bbox": [0, 0, 100, 100],
+    }
+
+    FaceEnrollmentService._validate_enrollment_quality(metadata)
+
+    assert metadata["enrollment_quality_checked"] is True
+
+
+@pytest.mark.asyncio
+async def test_face_upload_rejects_too_many_images() -> None:
+    service = object.__new__(FaceEnrollmentService)
+    uploads = [
+        UploadFile(BytesIO(b"image-contents"), filename=f"face-{index}.jpg")
+        for index in range(6)
+    ]
+    person = Person(full_name="Test Person", reference_id="TEST-001")
+
+    with pytest.raises(HTTPException, match="Select up to 5 face images"):
+        await service.build_enrollments_from_uploads(person, uploads)
+
+
+@pytest.mark.asyncio
+async def test_face_upload_rejects_oversized_image() -> None:
+    service = object.__new__(FaceEnrollmentService)
+    upload = UploadFile(BytesIO(b"x" * ((10 * 1024 * 1024) + 1)), filename="large.jpg")
+    person = Person(full_name="Test Person", reference_id="TEST-001")
+
+    with pytest.raises(HTTPException, match="large.jpg is too large"):
+        await service.build_enrollments_from_uploads(person, [upload])
+
+
+@pytest.mark.asyncio
+async def test_face_upload_validation_error_names_the_rejected_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = object.__new__(FaceEnrollmentService)
+
+    def reject_image(_contents: bytes):
+        raise HTTPException(
+            status_code=422,
+            detail="Face detection confidence is too low for reliable enrollment",
+        )
+
+    monkeypatch.setattr(service, "_extract_embedding", reject_image)
+    upload = UploadFile(BytesIO(b"image-contents"), filename="blurry.jpg")
+    person = Person(full_name="Test Person", reference_id="TEST-001")
+
+    with pytest.raises(HTTPException, match="blurry.jpg: Face detection confidence"):
+        await service.build_enrollments_from_uploads(person, [upload])
+
+
+def test_runtime_identity_payload_filters_duplicate_and_low_quality_templates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "recognition_runtime_max_templates_per_person", 2)
+    model_name = CameraDetectionService._runtime_embedding_model_name()
+    profiles = [
+        {
+            "id": "best",
+            "embedding_vector": [1.0] * 16,
+            "embedding_model": model_name,
+            "metadata": {"det_score": 0.99},
+        },
+        {
+            "id": "duplicate",
+            "embedding_vector": [1.0] * 16,
+            "embedding_model": model_name,
+            "metadata": {"det_score": 0.98},
+        },
+        {
+            "id": "side",
+            "embedding_vector": [1.0, -1.0] * 8,
+            "embedding_model": model_name,
+            "metadata": {"det_score": 0.90},
+        },
+        {
+            "id": "blurred",
+            "embedding_vector": [0.5] * 16,
+            "embedding_model": model_name,
+            "metadata": {"det_score": 0.30},
+        },
+    ]
+
+    selected = CameraDetectionService._curate_face_profiles(profiles)
+
+    assert [profile["id"] for profile in selected] == ["best", "side"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_identity_payload_refreshes_stale_embedding_model(
+    session: AsyncSession,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+    monkeypatch.setattr(settings, "recognition_backend", "insightface")
+    monkeypatch.setattr(settings, "recognition_insightface_model", "buffalo_m")
+
+    person = await PersonRepository(session).create(
+        PersonCreate(full_name="Dana Holt", person_type="employee", reference_id="EMP-REFRESH")
+    )
+    face_path = tmp_path / "faces" / "persons" / "emp-refresh" / "front.jpg"
+    face_path.parent.mkdir(parents=True, exist_ok=True)
+    face_path.write_bytes(b"stale-face-image")
+    await PersonRepository(session).add_face_profile(
+        person,
+        PersonFaceEnrollment(
+            image_path="faces/persons/emp-refresh/front.jpg",
+            label="Front profile",
+            embedding_vector=[0.1] * 512,
+            embedding_model="insightface-buffalo_l",
+            is_primary=True,
+            metadata={"backend": "insightface", "det_score": 0.99},
+        ),
+    )
+
+    class StubBackend:
+        def extract_embedding(self, image_bytes: bytes) -> FaceEmbeddingResult:
+            assert image_bytes == b"stale-face-image"
+            return FaceEmbeddingResult(
+                vector=[0.2] * 512,
+                model_name="insightface-buffalo_m",
+                backend_name="insightface",
+                metadata={"backend": "insightface", "det_score": 0.98},
+            )
+
+    service = CameraDetectionService(session)
+    monkeypatch.setattr(service, "_runtime_face_embedding_backend", lambda: StubBackend())
+
+    prepared = await service._prepare_known_persons_for_recognition([person])
+    payload = service._serialize_known_person(prepared[0])
+
+    assert payload["face_profiles"][0]["embedding_model"] == "insightface-buffalo_m"
+    assert payload["face_profiles"][0]["embedding_vector"] == [0.2] * 512
+    assert payload["face_profiles"][0]["metadata"]["runtime_embedding_refreshed"] is True
+
+    embedding_row = await session.scalar(select(PersonFaceEmbedding))
+    assert embedding_row is not None
+    assert embedding_row.embedding_model == "insightface-buffalo_m"
 
 
 @pytest.mark.asyncio
@@ -116,6 +292,12 @@ async def test_person_routes_support_crud_and_face_enrollment(
     assert patch_response.status_code == 200
     assert patch_response.json()["department"] == "Security"
     assert patch_response.json()["is_active"] is False
+
+    delete_response = await client.delete(f"/api/v1/persons/{person_id}")
+    assert delete_response.status_code == 204
+
+    get_response = await client.get(f"/api/v1/persons/{person_id}")
+    assert get_response.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -186,6 +368,17 @@ async def test_person_routes_support_multi_image_upload_enrollment(
 
 @pytest.mark.asyncio
 async def test_person_routes_enforce_write_rbac(client: AsyncClient, session: AsyncSession) -> None:
+    operator = await UserRepository(session).create(
+        UserCreate(
+            email="operator@aegispro.local",
+            full_name="Operator",
+            role=UserRole.operator,
+            password="ChangeMe123!",
+        )
+    )
+    person = await PersonRepository(session).create(
+        PersonCreate(full_name="Blocked User", person_type="employee", reference_id="EMP-2002")
+    )
     viewer = await UserRepository(session).create(
         UserCreate(
             email="viewer@aegispro.local",
@@ -194,6 +387,26 @@ async def test_person_routes_enforce_write_rbac(client: AsyncClient, session: As
             password="ChangeMe123!",
         )
     )
+    await _set_current_user(operator)
+
+    operator_list_response = await client.get("/api/v1/persons")
+    assert operator_list_response.status_code == 200
+
+    operator_create_response = await client.post(
+        "/api/v1/persons",
+        json={"full_name": "Blocked Operator", "person_type": "employee", "reference_id": "EMP-2003"},
+    )
+    assert operator_create_response.status_code == 403
+
+    operator_patch_response = await client.patch(
+        f"/api/v1/persons/{person.id}",
+        json={"department": "Security"},
+    )
+    assert operator_patch_response.status_code == 403
+
+    operator_delete_response = await client.delete(f"/api/v1/persons/{person.id}")
+    assert operator_delete_response.status_code == 403
+
     await _set_current_user(viewer)
 
     list_response = await client.get("/api/v1/persons")
@@ -201,7 +414,7 @@ async def test_person_routes_enforce_write_rbac(client: AsyncClient, session: As
 
     create_response = await client.post(
         "/api/v1/persons",
-        json={"full_name": "Blocked User", "person_type": "employee", "reference_id": "EMP-2002"},
+        json={"full_name": "Blocked Viewer", "person_type": "employee", "reference_id": "EMP-2004"},
     )
     assert create_response.status_code == 403
 

@@ -5,11 +5,21 @@ import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useSta
 import type { ReactNode, RefCallback } from "react";
 import { EmptyState } from "@/components/dashboard-ui";
 import type { Camera, CameraDetectionScanSummary, CameraStreamDescriptor, DetectionOverlayBox } from "@/lib/api";
-import { fetchProtectedMedia } from "@/lib/api";
 import { cn } from "@/lib/cn";
 
+const MAX_LIVE_CAPTURE_EDGE = 960;
+
+export type CapturedCameraFrame = {
+  contentBase64: string;
+  contentType: string;
+  width: number;
+  height: number;
+  sourceWidth: number;
+  sourceHeight: number;
+};
+
 export type CameraStreamPanelHandle = {
-  captureFrame: () => Promise<{ contentBase64: string; contentType: string } | null>;
+  captureFrame: () => Promise<CapturedCameraFrame | null>;
 };
 
 export const CameraStreamPanel = forwardRef<CameraStreamPanelHandle, {
@@ -25,20 +35,12 @@ export const CameraStreamPanel = forwardRef<CameraStreamPanelHandle, {
   detections = [],
   variant = "detail"
 }, ref) {
-  const [protectedMedia, setProtectedMedia] = useState<{
-    sourcePath: string | null;
-    url: string | null;
-    error: string | null;
-  }>({
-    sourcePath: null,
-    url: null,
-    error: null
-  });
   const cameraTurnedOff = camera.status === "disabled";
   const protectedPath = stream.stream_url?.startsWith("/api/") ? stream.stream_url : null;
   const imageRef = useRef<HTMLImageElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const surfaceRef = useRef<HTMLDivElement | null>(null);
+  const [mediaLoadError, setMediaLoadError] = useState<{ key: string; message: string } | null>(null);
   const [activeMediaElement, setActiveMediaElement] = useState<HTMLImageElement | HTMLVideoElement | null>(null);
   const [surfaceVersion, setSurfaceVersion] = useState(0);
   const setImageElement = useCallback<RefCallback<HTMLImageElement>>((element) => {
@@ -77,44 +79,6 @@ export const CameraStreamPanel = forwardRef<CameraStreamPanelHandle, {
   }));
 
   useEffect(() => {
-    if (!protectedPath || cameraTurnedOff) {
-      return;
-    }
-
-    let objectUrl: string | null = null;
-    let cancelled = false;
-
-    fetchProtectedMedia(accessToken, protectedPath)
-      .then((blob) => {
-        if (cancelled) {
-          return;
-        }
-        objectUrl = URL.createObjectURL(blob);
-        setProtectedMedia({
-          sourcePath: protectedPath,
-          url: objectUrl,
-          error: null
-        });
-      })
-      .catch((error: Error) => {
-        if (!cancelled) {
-          setProtectedMedia({
-            sourcePath: protectedPath,
-            url: null,
-            error: error.message
-          });
-        }
-      });
-
-    return () => {
-      cancelled = true;
-      if (objectUrl) {
-        URL.revokeObjectURL(objectUrl);
-      }
-    };
-  }, [accessToken, cameraTurnedOff, protectedPath]);
-
-  useEffect(() => {
     const mediaElements = [imageRef.current, videoRef.current].filter(Boolean) as Array<
       HTMLImageElement | HTMLVideoElement
     >;
@@ -143,15 +107,11 @@ export const CameraStreamPanel = forwardRef<CameraStreamPanelHandle, {
         element.removeEventListener("load", handleSurfaceChange);
       });
     };
-  }, [protectedMedia.url, stream.stream_kind]);
+  }, [stream.stream_kind]);
 
-  const protectedMediaReady = protectedMedia.sourcePath === protectedPath;
-  const playbackUrl = protectedPath
-    ? protectedMediaReady
-      ? protectedMedia.url
-      : null
-    : stream.stream_url;
-  const mediaError = protectedPath && protectedMediaReady ? protectedMedia.error : null;
+  const playbackUrl = protectedPath ? toProxiedPath(protectedPath, accessToken) : stream.stream_url;
+  const playbackKey = `${stream.stream_kind}:${playbackUrl ?? "none"}`;
+  const mediaError = mediaLoadError?.key === playbackKey ? mediaLoadError.message : null;
 
   if (cameraTurnedOff) {
     return (
@@ -207,6 +167,25 @@ export const CameraStreamPanel = forwardRef<CameraStreamPanelHandle, {
     );
   }
 
+  if (mediaError) {
+    return (
+      <FeedFrame
+        camera={camera}
+        stream={stream}
+        variant={variant}
+        statusMessage={mediaError}
+      >
+        <UnavailableStreamState
+          camera={camera}
+          stream={stream}
+          variant={variant}
+          title="Preview failed to load"
+          description={mediaError}
+        />
+      </FeedFrame>
+    );
+  }
+
   if (stream.stream_kind === "image") {
     return (
       <FeedFrame
@@ -221,6 +200,12 @@ export const CameraStreamPanel = forwardRef<CameraStreamPanelHandle, {
             ref={setImageElement}
             src={playbackUrl}
             alt={`${camera.name} preview`}
+            onLoad={() => {
+              if (mediaError) {
+                setMediaLoadError(null);
+              }
+            }}
+            onError={() => setMediaLoadError({ key: playbackKey, message: buildPreviewErrorMessage(camera, stream) })}
             className={cn(
               "h-full w-full rounded-[24px] object-cover",
               variant === "tile" ? "max-h-[320px]" : "max-h-[480px]"
@@ -248,9 +233,24 @@ export const CameraStreamPanel = forwardRef<CameraStreamPanelHandle, {
         <video
           ref={setVideoElement}
           src={playbackUrl}
+          onLoadedData={() => {
+            if (mediaError) {
+              setMediaLoadError(null);
+            }
+          }}
+          onError={() => setMediaLoadError({ key: playbackKey, message: buildPreviewErrorMessage(camera, stream) })}
+          onEnded={(event) => {
+            if (camera.source_type !== "file") {
+              return;
+            }
+            event.currentTarget.currentTime = 0;
+            void event.currentTarget.play();
+          }}
           controls
-          autoPlay={stream.is_live}
+          autoPlay={stream.is_live || camera.source_type === "file"}
+          loop={camera.source_type === "file"}
           muted
+          preload="auto"
           playsInline
           className={cn(
             "h-full w-full rounded-[24px] bg-black object-contain",
@@ -267,6 +267,23 @@ export const CameraStreamPanel = forwardRef<CameraStreamPanelHandle, {
     </FeedFrame>
   );
 });
+
+function toProxiedPath(path: string, accessToken: string) {
+  void accessToken;
+  return path.startsWith("/api/") ? `/backend${path}` : path;
+}
+
+function buildPreviewErrorMessage(camera: Camera, stream: CameraStreamDescriptor) {
+  if (stream.health_status === "offline") {
+    return stream.health_message || "The camera is offline and the preview stream could not be opened.";
+  }
+
+  if (camera.source_type === "http") {
+    return "The camera preview could not be loaded. Confirm the phone camera app is actively serving this URL and then run Test connection.";
+  }
+
+  return "The camera preview could not be loaded in the browser.";
+}
 
 function BrowserCameraPreview({
   deviceId,
@@ -334,27 +351,53 @@ function BrowserCameraPreview({
 
 function drawToBase64(
   element: HTMLVideoElement | HTMLImageElement,
-  width: number,
-  height: number
+  sourceWidth: number,
+  sourceHeight: number
 ) {
   const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
+  // Both YOLO and InsightFace ultimately analyze a bounded input. Resizing the
+  // browser snapshot before JPEG encoding avoids transporting and decoding a
+  // full 1080p/4K frame for every scan. The response boxes are scaled back to
+  // the media's natural coordinate space by the camera page.
+  const scale = Math.min(
+    1,
+    MAX_LIVE_CAPTURE_EDGE / sourceWidth,
+    MAX_LIVE_CAPTURE_EDGE / sourceHeight
+  );
+  canvas.width = Math.max(1, Math.round(sourceWidth * scale));
+  canvas.height = Math.max(1, Math.round(sourceHeight * scale));
   const context = canvas.getContext("2d");
   if (!context) {
     return Promise.resolve(null);
   }
-  context.drawImage(element, 0, 0, width, height);
-  const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
-  const [, contentBase64 = ""] = dataUrl.split(",", 2);
-  return Promise.resolve(
-    contentBase64
-      ? {
-          contentBase64,
-          contentType: "image/jpeg"
-        }
-      : null
-  );
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.drawImage(element, 0, 0, canvas.width, canvas.height);
+  return new Promise<CapturedCameraFrame | null>((resolve) => {
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        resolve(null);
+        return;
+      }
+      const reader = new FileReader();
+      reader.onerror = () => resolve(null);
+      reader.onload = () => {
+        const dataUrl = typeof reader.result === "string" ? reader.result : "";
+        const [, contentBase64 = ""] = dataUrl.split(",", 2);
+        resolve(contentBase64
+          ? {
+              contentBase64,
+              contentType: blob.type || "image/jpeg",
+              width: canvas.width,
+              height: canvas.height,
+              sourceWidth,
+              sourceHeight
+            }
+          : null);
+      };
+      reader.readAsDataURL(blob);
+    }, "image/jpeg", 0.78);
+  });
 }
 
 function DetectionOverlay({
@@ -433,7 +476,8 @@ function DetectionOverlay({
               style={{
                 ...style,
                 borderColor: palette.border,
-                backgroundColor: palette.fill
+                backgroundColor: palette.fill,
+                transition: "left 90ms linear, top 90ms linear, width 90ms linear, height 90ms linear"
               }}
             >
               <div
@@ -470,7 +514,14 @@ function DetectionOverlay({
 function shouldRenderPrimaryBox(detection: CameraDetectionScanSummary) {
   return Boolean(
     detection.bounding_box
-      && ["weapon", "fire", "smoke", "person", "known_person", "unknown_person"].includes(detection.detection_type)
+      && (
+        ["weapon", "fire", "smoke"].includes(detection.detection_type)
+        // Recognition already provides a more precise face box. Drawing the
+        // coarse person box as well creates the large overlapping rectangles
+        // seen on moving browser-camera subjects.
+        || (!detection.face_bounding_box
+          && ["person", "known_person", "unknown_person"].includes(detection.detection_type))
+      )
   );
 }
 

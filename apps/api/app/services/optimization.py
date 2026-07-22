@@ -110,6 +110,8 @@ class OptimizationService:
             gpu_memory_used_mb=runtime.gpu_memory_used_mb,
             gpu_memory_total_mb=runtime.gpu_memory_total_mb,
             detail=runtime.detail,
+            capacity=runtime.capacity,
+            validation_gates=runtime.validation_gates,
         )
 
     @staticmethod
@@ -157,6 +159,24 @@ class OptimizationService:
                     title="Watch GPU saturation",
                     detail=f"GPU utilization is {runtime.gpu_utilization_percent}%. Lower inference FPS or scale camera workers before production rollout.",
                     severity="warning",
+                )
+            )
+
+        gate_status = str(runtime.validation_gates.get("status") or "").lower()
+        if gate_status == "missing":
+            recommendations.append(
+                OptimizationRecommendation(
+                    title="Record runtime validation gates",
+                    detail="The 8h, 24h, 72h soak or load gate report is missing. Capture the run before promoting this detector stack.",
+                    severity="warning",
+                )
+            )
+        elif gate_status == "fail":
+            recommendations.append(
+                OptimizationRecommendation(
+                    title="Do not promote failing runtime gates",
+                    detail="At least one soak or load validation gate is failing. Hold rollout until the report is green.",
+                    severity="critical",
                 )
             )
 

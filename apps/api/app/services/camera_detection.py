@@ -2,6 +2,8 @@ import base64
 import asyncio
 import json
 import logging
+import math
+from dataclasses import dataclass
 from pathlib import Path
 from urllib import error, request
 
@@ -24,10 +26,27 @@ from app.schemas.detections import (
     DetectionEventIngestItem,
     InlineEvidencePayload,
 )
+from app.services.camera_overlays import camera_overlay_store
+from app.services.camera_secrets import CameraSecretManager
 from app.services.camera_streams import CameraStreamingService
 from app.services.detection_events import DetectionEventService
+from app.services.face_embeddings import FaceEmbeddingBackend, FaceEmbeddingError, build_face_embedding_backend
+from app.services.media_agent import LocalSubprocessMediaAgent
+from app.services.ring_buffer_media import ring_buffer_media_service
 
 logger = logging.getLogger(__name__)
+THREAT_DETECTION_TYPES = {"weapon", "fire", "smoke"}
+
+
+@dataclass(slots=True)
+class ContinuousScanResult:
+    camera_id: object
+    success: bool
+    detection_count: int = 0
+    incident_count: int = 0
+    alert_count: int = 0
+    ignored_count: int = 0
+    error: str | None = None
 
 
 class CameraDetectionService:
@@ -37,6 +56,9 @@ class CameraDetectionService:
         self.persons = PersonRepository(session)
         self.events = DetectionEventService(session)
         self.streams = CameraStreamingService(self.cameras)
+        self.media_agent = LocalSubprocessMediaAgent(self.streams.network_policy)
+        self.media_buffer = ring_buffer_media_service
+        self._face_embedding_backend: FaceEmbeddingBackend | None = None
 
     async def run_scan(
         self,
@@ -56,7 +78,9 @@ class CameraDetectionService:
         if not frame_content_base64:
             frame_content_base64, frame_content_type = await self._load_frame_from_camera(camera)
 
-        known_persons = [person for person in await self.persons.list() if person.is_active]
+        known_persons = await self._prepare_known_persons_for_recognition(
+            [person for person in await self.persons.list() if person.is_active]
+        )
         inference_result = await self._run_inference(
             camera=camera,
             payload=payload,
@@ -64,7 +88,13 @@ class CameraDetectionService:
             frame_content_type=frame_content_type,
             known_persons=known_persons,
         )
-        ingest_payload = self._build_ingest_payload(camera_id, inference_result)
+        ingest_payload = await self._build_ingest_payload(
+            camera,
+            inference_result,
+            payload,
+            frame_content_base64=frame_content_base64,
+            frame_content_type=frame_content_type,
+        )
         ingest_result = await self.events.ingest(ingest_payload, allow_disabled_camera=True)
 
         detections = inference_result.get("detections", [])
@@ -77,6 +107,7 @@ class CameraDetectionService:
                     "label": detection.get("label"),
                     "object_label": detection.get("object_label"),
                     "confidence": detection.get("confidence"),
+                    "provisional": detection.get("provisional", False),
                 }
                 for detection in detections
             ],
@@ -91,7 +122,7 @@ class CameraDetectionService:
             )
         if metadata.get("backend_warning"):
             ignored_reasons.append(str(metadata["backend_warning"]))
-        return CameraDetectionScanResponse(
+        response = CameraDetectionScanResponse(
             camera_id=camera_id,
             model_name=inference_result["model_name"],
             model_version=inference_result.get("model_version") or "",
@@ -99,29 +130,125 @@ class CameraDetectionService:
             incident_count=ingest_result.incident_count,
             alert_count=ingest_result.alert_count,
             ignored_count=ingest_result.ignored_count,
-            detections=[
-                CameraDetectionScanSummary(
-                    detection_type=str(detection.get("label", "unknown")),
-                    confidence=float(detection.get("confidence", 0)),
-                    track_id=detection.get("track_id"),
-                    recognition_status=(detection.get("recognition") or {}).get("status"),
-                    identity_label=(detection.get("recognition") or {}).get("identity_label"),
-                    bounding_box=DetectionBoundingBox(
-                        x1=float(detection.get("x1", 0)),
-                        y1=float(detection.get("y1", 0)),
-                        x2=float(detection.get("x2", 0)),
-                        y2=float(detection.get("y2", 0)),
-                        label=str(detection.get("object_label") or detection.get("label", "unknown")),
-                    ),
-                    face_bounding_box=self._face_box(detection.get("face_region")),
-                    metadata=(detection.get("recognition") or {}).get("metadata", {}),
-                )
-                for detection in detections
-            ],
+            detections=self._summarize_detections(detections),
             ignored_reasons=ignored_reasons,
             backend=metadata.get("backend"),
             callback_delivered=False,
         )
+        await camera_overlay_store.publish(camera.id, response.detections)
+        return response
+
+    async def run_continuous_batch(
+        self,
+        camera_ids: list[object],
+        payload: CameraDetectionScanRequest,
+    ) -> list[ContinuousScanResult]:
+        cameras: list[Camera] = []
+        for camera_id in camera_ids:
+            camera = await self.cameras.get(camera_id)
+            if camera is not None:
+                cameras.append(camera)
+
+        if not cameras:
+            return []
+
+        known_persons = await self._prepare_known_persons_for_recognition(
+            [person for person in await self.persons.list() if person.is_active]
+        )
+        frame_results = await asyncio.gather(
+            *(self._load_frame_from_camera(camera) for camera in cameras),
+            return_exceptions=True,
+        )
+
+        inference_requests: list[dict] = []
+        ready_cameras: list[Camera] = []
+        ready_frames: list[tuple[str, str]] = []
+        results: list[ContinuousScanResult] = []
+        for camera, frame_result in zip(cameras, frame_results):
+            if isinstance(frame_result, Exception):
+                results.append(
+                    ContinuousScanResult(
+                        camera_id=camera.id,
+                        success=False,
+                        error=str(getattr(frame_result, "detail", frame_result)),
+                    )
+                )
+                continue
+
+            frame_content_base64, frame_content_type = frame_result
+            inference_requests.append(
+                self._build_inference_request_payload(
+                    camera=camera,
+                    payload=payload,
+                    frame_content_base64=frame_content_base64,
+                    frame_content_type=frame_content_type,
+                    known_persons=known_persons,
+                    manual_scan=False,
+                )
+            )
+            ready_cameras.append(camera)
+            ready_frames.append(frame_result)
+
+        if not inference_requests:
+            return results
+
+        inference_results = await self._run_inference_batch(inference_requests)
+        for camera, inference_result, frame in zip(
+            ready_cameras,
+            inference_results,
+            ready_frames,
+        ):
+            try:
+                detections = inference_result.get("detections", [])
+                await camera_overlay_store.publish(
+                    camera.id,
+                    self._summarize_detections(detections),
+                )
+                ingest_payload = await self._build_ingest_payload(
+                    camera,
+                    inference_result,
+                    payload,
+                    frame_content_base64=frame[0],
+                    frame_content_type=frame[1],
+                )
+                ingest_result = await self.events.ingest(ingest_payload, allow_disabled_camera=True)
+                logger.info(
+                    "camera_batch_scan camera_id=%s detections=%s inference_fps=%s batch_size=%s",
+                    camera.id,
+                    [
+                        {
+                            "label": detection.get("label"),
+                            "object_label": detection.get("object_label"),
+                            "confidence": detection.get("confidence"),
+                        }
+                        for detection in detections
+                    ],
+                    inference_result.get("inference_fps"),
+                    len(inference_requests),
+                )
+                results.append(
+                    ContinuousScanResult(
+                        camera_id=camera.id,
+                        success=True,
+                        detection_count=len(detections),
+                        incident_count=ingest_result.incident_count,
+                        alert_count=ingest_result.alert_count,
+                        ignored_count=ingest_result.ignored_count,
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Continuous incident persistence failed for camera %s", camera.id)
+                results.append(
+                    ContinuousScanResult(
+                        camera_id=camera.id,
+                        success=False,
+                        error=str(getattr(exc, "detail", exc)),
+                    )
+                )
+
+        return results
 
     async def _load_frame_from_camera(self, camera: Camera) -> tuple[str, str]:
         if camera.source_type is CameraSourceType.file:
@@ -129,95 +256,75 @@ class CameraDetectionService:
                 source_path = self.streams.resolve_file_source(camera)
             except ValueError as exc:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-            return await asyncio.to_thread(self._load_frame_from_file, source_path)
+            return self._remember_frame(
+                camera,
+                await asyncio.to_thread(self._load_frame_from_file, source_path),
+            )
 
         if camera.source_type is CameraSourceType.http:
             errors: list[str] = []
-            for source in self.streams._http_source_candidates(camera):
-                if Path(source).suffix.lower() in {".m3u8", ".mp4", ".webm", ".mov"}:
-                    continue
+            runtime_source = await self.streams.cameras.get_runtime_source(camera)
+            for source in self.streams._http_source_candidates(camera, runtime_source):
                 try:
-                    return await asyncio.to_thread(self._load_frame_from_http, source)
+                    return self._remember_frame(
+                        camera,
+                        await asyncio.to_thread(self._load_frame_from_http, camera, source),
+                    )
                 except HTTPException as exc:
                     errors.append(str(exc.detail))
-            try:
-                return await asyncio.to_thread(self._load_frame_with_opencv, camera.source)
-            except HTTPException:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=(
-                        "No frame could be read from this HTTP camera. Configure metadata.stream_url "
-                        "with a snapshot or media URL. " + (" ".join(errors) if errors else "")
-                    ).strip(),
-                )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "No frame could be read from this HTTP camera. Configure metadata.stream_url "
+                    "with a snapshot or media URL. " + (" ".join(errors) if errors else "")
+                ).strip(),
+            )
 
         if camera.source_type is CameraSourceType.rtsp:
-            return await asyncio.to_thread(self._load_frame_with_opencv, camera.source)
+            runtime_source = await self.streams.cameras.get_runtime_source(camera)
+            frame = await asyncio.to_thread(
+                self.media_agent.capture_opencv_frame,
+                runtime_source,
+                display_source=camera.source,
+            )
+            return self._remember_frame(camera, (frame.content_base64, frame.content_type))
 
         if camera.source_type is CameraSourceType.usb:
             source = int(camera.source) if camera.source.isdigit() else camera.source
-            return await asyncio.to_thread(self._load_frame_with_opencv, source)
+            frame = await asyncio.to_thread(self.media_agent.capture_opencv_frame, source)
+            return self._remember_frame(camera, (frame.content_base64, frame.content_type))
 
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This camera source needs a browser-captured frame. Open the camera page and run the AI scan from the live preview.",
         )
 
-    @staticmethod
-    def _load_frame_from_file(source_path: Path) -> tuple[str, str]:
+    def _remember_frame(self, camera: Camera, frame: tuple[str, str]) -> tuple[str, str]:
+        content_base64, content_type = frame
+        self.media_buffer.add_frame(
+            camera.id,
+            content_base64=content_base64,
+            content_type=content_type,
+        )
+        return frame
+
+    def _load_frame_from_file(self, source_path: Path) -> tuple[str, str]:
         if not source_path.is_file():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Camera media file not found")
         content_type = CameraDetectionService._guess_content_type(source_path.suffix.lower())
         if not content_type.startswith("image/"):
-            return CameraDetectionService._load_frame_with_opencv(str(source_path))
+            frame = self.media_agent.capture_opencv_frame(str(source_path), display_source=str(source_path))
+            return frame.content_base64, frame.content_type
         return base64.b64encode(source_path.read_bytes()).decode("utf-8"), content_type
 
-    @staticmethod
-    def _load_frame_with_opencv(source: str | int) -> tuple[str, str]:
-        try:
-            import cv2
-        except ImportError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="OpenCV is required to read USB, RTSP, and video camera frames.",
-            ) from exc
-        capture = cv2.VideoCapture(source)
-        try:
-            ok, frame = capture.read()
-            if not ok or frame is None:
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"Unable to decode a frame from camera source {source}.",
-                )
-            encoded, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-            if not encoded:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Unable to encode the captured camera frame.",
-                )
-            return base64.b64encode(buffer.tobytes()).decode("utf-8"), "image/jpeg"
-        finally:
-            capture.release()
-
-    @staticmethod
-    def _load_frame_from_http(source: str) -> tuple[str, str]:
-        req = request.Request(source, headers={"User-Agent": "AegisPro/1.0"})
-        try:
-            with request.urlopen(req, timeout=5) as response:
-                content_type = response.headers.get_content_type()
-                if not content_type.startswith("image/"):
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="This HTTP source is not serving a single image frame. Open the camera page and run the AI scan from the live preview.",
-                    )
-                return base64.b64encode(response.read()).decode("utf-8"), content_type
-        except HTTPException:
-            raise
-        except error.URLError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Unable to read the camera source: {exc}",
-            ) from exc
+    def _load_frame_from_http(self, camera: Camera, source: str) -> tuple[str, str]:
+        source_descriptor = CameraSecretManager.build_candidate_descriptor(CameraSourceType.http, source)
+        frame = self.media_agent.capture_http_frame(
+            source=source,
+            source_descriptor=source_descriptor,
+            skip_tls_verification=self.streams._should_skip_tls_verification(camera, source),
+        )
+        return frame.content_base64, frame.content_type
 
     async def _run_inference(
         self,
@@ -229,24 +336,14 @@ class CameraDetectionService:
         known_persons: list[Person],
     ) -> dict:
         body = json.dumps(
-            {
-                "camera_id": str(camera.id),
-                "frame_reference": f"camera-scan:{camera.id}",
-                "source_type": camera.source_type.value,
-                "frame_content_base64": frame_content_base64,
-                "frame_content_type": frame_content_type,
-                "include_evidence": payload.include_evidence,
-                "requested_detectors": payload.requested_detectors,
-                "recognition_enabled": payload.recognition_enabled,
-                "known_persons": [self._serialize_known_person(person) for person in known_persons],
-                "occurrence_hint": payload.occurrence_hint or "manual_scan",
-                "metadata": {
-                    "camera_name": camera.name,
-                    "camera_location": camera.location,
-                    "camera_group": camera.group,
-                    "manual_scan": True,
-                },
-            }
+            self._build_inference_request_payload(
+                camera=camera,
+                payload=payload,
+                frame_content_base64=frame_content_base64,
+                frame_content_type=frame_content_type,
+                known_persons=known_persons,
+                manual_scan=True,
+            )
         ).encode("utf-8")
         req = request.Request(
             f"{settings.ai_service_url.rstrip('/')}/v1/inference/run",
@@ -268,13 +365,66 @@ class CameraDetectionService:
                 detail=f"AI service is unavailable at {settings.ai_service_url}: {exc.reason}",
             ) from exc
 
+    async def _run_inference_batch(self, payloads: list[dict]) -> list[dict]:
+        body = json.dumps({"requests": payloads}).encode("utf-8")
+        req = request.Request(
+            f"{settings.ai_service_url.rstrip('/')}/v1/inference/run-batch",
+            data=body,
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        try:
+            response = await asyncio.to_thread(self._send_inference_request, req)
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"AI service rejected the batch scan request: {detail or exc.reason}",
+            ) from exc
+        except error.URLError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"AI service is unavailable at {settings.ai_service_url}: {exc.reason}",
+            ) from exc
+        return response.get("results", [])
+
     @staticmethod
     def _send_inference_request(req: request.Request) -> dict:
         with request.urlopen(req, timeout=60) as response:
             return json.loads(response.read().decode("utf-8"))
 
+    def _build_inference_request_payload(
+        self,
+        *,
+        camera: Camera,
+        payload: CameraDetectionScanRequest,
+        frame_content_base64: str,
+        frame_content_type: str | None,
+        known_persons: list[Person],
+        manual_scan: bool,
+    ) -> dict:
+        return {
+            "camera_id": str(camera.id),
+            "frame_reference": f"camera-scan:{camera.id}",
+            "source_type": camera.source_type.value,
+            "frame_content_base64": frame_content_base64,
+            "frame_content_type": frame_content_type,
+            "include_evidence": payload.include_evidence,
+            "requested_detectors": payload.requested_detectors,
+            "recognition_enabled": payload.recognition_enabled,
+            "known_persons": [self._serialize_known_person(person) for person in known_persons],
+            "occurrence_hint": payload.occurrence_hint or ("manual_scan" if manual_scan else "continuous_monitoring"),
+            "metadata": {
+                "camera_name": camera.name,
+                "camera_location": camera.location,
+                "camera_group": camera.group,
+                "manual_scan": manual_scan,
+            },
+        }
+
     @staticmethod
     def _serialize_known_person(person: Person) -> dict:
+        profiles = CameraDetectionService._curate_face_profiles(person.face_profiles)
         return {
             "person_id": str(person.id),
             "full_name": person.full_name,
@@ -291,15 +441,179 @@ class CameraDetectionService:
                     "embedding_model": profile.get("embedding_model"),
                     "metadata": profile.get("metadata", {}),
                 }
-                for profile in person.face_profiles
-                if profile.get("embedding_vector")
+                for profile in profiles
             ],
         }
 
     @staticmethod
-    def _build_ingest_payload(camera_id, inference_result: dict) -> DetectionEventIngest:
+    def _curate_face_profiles(profiles: list[dict]) -> list[dict]:
+        eligible: list[tuple[float, dict]] = []
+        for profile in profiles:
+            vector = profile.get("embedding_vector") or []
+            if not vector:
+                continue
+            if not CameraDetectionService._profile_matches_runtime_embedding_model(profile):
+                continue
+            raw_score = (profile.get("metadata") or {}).get("det_score")
+            try:
+                score = float(raw_score) if raw_score is not None else 1.0
+            except (TypeError, ValueError):
+                score = 1.0
+            if score < settings.recognition_runtime_template_min_det_score:
+                continue
+            eligible.append((score, profile))
+
+        selected: list[dict] = []
+        for _, profile in sorted(eligible, key=lambda item: item[0], reverse=True):
+            vector = profile.get("embedding_vector") or []
+            if any(
+                len(vector) == len(existing.get("embedding_vector") or [])
+                and CameraDetectionService._cosine_similarity(
+                    vector,
+                    existing.get("embedding_vector") or [],
+                )
+                >= settings.recognition_runtime_template_duplicate_similarity
+                for existing in selected
+            ):
+                continue
+            selected.append(profile)
+            if len(selected) >= settings.recognition_runtime_max_templates_per_person:
+                break
+        return selected
+
+    async def _prepare_known_persons_for_recognition(self, persons: list[Person]) -> list[Person]:
+        for person in persons:
+            if self._curate_face_profiles(person.face_profiles):
+                continue
+            await self._refresh_stale_face_embeddings(person)
+        return persons
+
+    async def _refresh_stale_face_embeddings(self, person: Person) -> None:
+        refreshed = 0
+        for profile in person.face_profiles:
+            if refreshed >= settings.recognition_runtime_max_templates_per_person:
+                break
+            if self._profile_matches_runtime_embedding_model(profile):
+                continue
+
+            image_path = profile.get("image_path")
+            face_profile_id = profile.get("id")
+            if not image_path or not face_profile_id:
+                continue
+
+            source = (settings.storage_root / image_path).resolve()
+            storage_root = settings.storage_root.resolve()
+            if source != storage_root and storage_root not in source.parents:
+                continue
+            if not source.is_file():
+                continue
+
+            try:
+                result = self._runtime_face_embedding_backend().extract_embedding(
+                    source.read_bytes()
+                )
+            except (FaceEmbeddingError, OSError):
+                logger.warning(
+                    "runtime_face_embedding_refresh_failed person_id=%s face_profile_id=%s",
+                    person.id,
+                    face_profile_id,
+                    exc_info=True,
+                )
+                continue
+
+            await self.persons.update_face_profile_embedding(
+                person,
+                str(face_profile_id),
+                embedding_vector=result.vector,
+                embedding_model=result.model_name,
+                metadata={
+                    **result.metadata,
+                    "runtime_embedding_refreshed": True,
+                    "runtime_embedding_previous_model": profile.get("embedding_model"),
+                },
+            )
+            refreshed += 1
+
+    def _runtime_face_embedding_backend(self) -> FaceEmbeddingBackend:
+        if self._face_embedding_backend is None:
+            self._face_embedding_backend = build_face_embedding_backend()
+        return self._face_embedding_backend
+
+    @staticmethod
+    def _profile_matches_runtime_embedding_model(profile: dict) -> bool:
+        expected_model = CameraDetectionService._runtime_embedding_model_name()
+        if profile.get("embedding_model") != expected_model:
+            return False
+
+        vector = profile.get("embedding_vector") or []
+        if not vector:
+            return False
+        if settings.recognition_backend == "hash":
+            return len(vector) == settings.recognition_embedding_dimensions
+        return True
+
+    @staticmethod
+    def _runtime_embedding_model_name() -> str:
+        if settings.recognition_backend == "insightface":
+            return f"insightface-{settings.recognition_insightface_model}"
+        return settings.recognition_embedding_model
+
+    @staticmethod
+    def _cosine_similarity(left: list[float], right: list[float]) -> float:
+        numerator = sum(first * second for first, second in zip(left, right))
+        left_magnitude = math.sqrt(sum(value * value for value in left))
+        right_magnitude = math.sqrt(sum(value * value for value in right))
+        if not left_magnitude or not right_magnitude:
+            return -1.0
+        return numerator / (left_magnitude * right_magnitude)
+
+    async def _build_ingest_payload(
+        self,
+        camera: Camera,
+        inference_result: dict,
+        scan_request: CameraDetectionScanRequest,
+        *,
+        frame_content_base64: str | None = None,
+        frame_content_type: str | None = None,
+    ) -> DetectionEventIngest:
+        clip = None
+        metadata = dict(inference_result.get("metadata", {}))
+        metadata["requested_detectors"] = list(scan_request.requested_detectors)
+        confirmed_detections = [
+            detection
+            for detection in inference_result.get("detections", [])
+            if not detection.get("provisional", False)
+        ]
+        snapshot_evidence = CameraDetectionService._inline_evidence(
+            inference_result.get("snapshot_evidence")
+        )
+        confirmed_threat = any(
+            detection.get("label") in THREAT_DETECTION_TYPES
+            for detection in confirmed_detections
+        )
+        if (
+            snapshot_evidence is None
+            and confirmed_threat
+            and scan_request.occurrence_hint == "dashboard_live_scan"
+            and frame_content_base64
+        ):
+            # Browser frames are already present in the API request. Persist only
+            # a confirmed threat frame so routine 200 ms scans remain lightweight.
+            snapshot_evidence = InlineEvidencePayload(
+                content_base64=frame_content_base64,
+                content_type=frame_content_type or "image/jpeg",
+            )
+            metadata["snapshot_source"] = "confirmed_dashboard_live_frame"
+        if scan_request.include_evidence and confirmed_detections:
+            clip = await self.media_buffer.build_event_clip(
+                camera.id,
+                capture_after_frame=lambda: self._load_frame_from_camera(camera),
+            )
+            if clip is not None:
+                metadata = {**metadata, **clip.metadata}
+
         return DetectionEventIngest(
-            camera_id=camera_id,
+            camera_id=camera.id,
             occurred_at=inference_result.get("occurred_at"),
             model_name=inference_result["model_name"],
             model_version=inference_result.get("model_version"),
@@ -307,9 +621,13 @@ class CameraDetectionService:
                 inference_result.get("inference_fps")
             ),
             source_fps=inference_result.get("source_fps"),
-            snapshot_evidence=CameraDetectionService._inline_evidence(
-                inference_result.get("snapshot_evidence")
-            ),
+            snapshot_evidence=snapshot_evidence,
+            clip_evidence=InlineEvidencePayload(
+                content_base64=clip.content_base64,
+                content_type=clip.content_type,
+            )
+            if clip is not None
+            else None,
             detections=[
                 DetectionEventIngestItem(
                     detection_type=detection["label"],
@@ -333,9 +651,9 @@ class CameraDetectionService:
                     ),
                     metadata=(detection.get("recognition") or {}).get("metadata", {}),
                 )
-                for detection in inference_result.get("detections", [])
+                for detection in confirmed_detections
             ],
-            metadata=inference_result.get("metadata", {}),
+            metadata=metadata,
         )
 
     @staticmethod
@@ -364,6 +682,40 @@ class CameraDetectionService:
             y2=face_region["y2"],
             label="face",
         )
+
+    @staticmethod
+    def _summarize_detections(detections: list[dict]) -> list[CameraDetectionScanSummary]:
+        return [
+            CameraDetectionScanSummary(
+                detection_type=str(detection.get("label", "unknown")),
+                object_label=detection.get("object_label"),
+                confidence=float(detection.get("confidence", 0)),
+                track_id=detection.get("track_id"),
+                recognition_status=(detection.get("recognition") or {}).get("status"),
+                identity_label=(detection.get("recognition") or {}).get("identity_label"),
+                bounding_box=DetectionBoundingBox(
+                    x1=float(detection.get("x1", 0)),
+                    y1=float(detection.get("y1", 0)),
+                    x2=float(detection.get("x2", 0)),
+                    y2=float(detection.get("y2", 0)),
+                    label=str(detection.get("object_label") or detection.get("label", "unknown")),
+                ),
+                face_bounding_box=CameraDetectionService._face_box(detection.get("face_region")),
+                metadata={
+                    **(detection.get("recognition") or {}).get("metadata", {}),
+                    "provisional": bool(detection.get("provisional", False)),
+                },
+            )
+            for detection in detections
+            if not CameraDetectionService._hide_from_operator_overlay(detection)
+        ]
+
+    @staticmethod
+    def _hide_from_operator_overlay(detection: dict) -> bool:
+        # Low-confidence weapon candidates are intentionally tracked internally
+        # for temporal confirmation, but showing an unconfirmed weapon overlay is
+        # too noisy for operators.
+        return detection.get("label") == "weapon" and bool(detection.get("provisional", False))
 
     @staticmethod
     def _guess_content_type(extension: str) -> str:

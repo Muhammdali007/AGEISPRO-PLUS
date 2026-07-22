@@ -8,6 +8,7 @@ export type IncidentStatus =
   | "investigating"
   | "resolved"
   | "dismissed";
+export type IncidentRetentionClass = "standard" | "extended" | "compliance" | "manual";
 export type DetectionType =
   | "weapon"
   | "fire"
@@ -21,8 +22,11 @@ export type RecognitionStatus = "known" | "unknown";
 export type MonitoringWindow = "24h" | "7d" | "30d";
 export type LiveEventType =
   | "system.connected"
+  | "sound.alert"
   | "incident.created"
   | "incident.updated"
+  | "incident.archived"
+  | "incident.deleted"
   | "alert.created"
   | "alert.acknowledged"
   | "alert.cleared";
@@ -43,6 +47,14 @@ export type UserCreateInput = {
   is_active: boolean;
 };
 
+export type UserUpdateInput = Partial<{
+  email: string;
+  full_name: string;
+  role: UserRole;
+  password: string;
+  is_active: boolean;
+}>;
+
 export type TokenPair = {
   access_token: string;
   refresh_token: string;
@@ -52,8 +64,11 @@ export type TokenPair = {
 export type SignupInput = {
   email: string;
   full_name: string;
-  role: UserRole;
   password: string;
+};
+
+export type PasswordResetMessage = {
+  detail: string;
 };
 
 export type Readiness = {
@@ -67,6 +82,8 @@ export type Camera = {
   name: string;
   source_type: CameraSourceType;
   source: string;
+  source_redacted: boolean;
+  credentials_rotation_required: boolean;
   status: CameraStatus;
   location: string | null;
   group: string | null;
@@ -91,6 +108,13 @@ export type CameraCreateInput = {
   detection_enabled: boolean;
   inference_fps: number;
   metadata?: Record<string, unknown>;
+};
+
+export type CameraMediaUpload = {
+  source: string;
+  filename: string;
+  content_type: string;
+  size: number;
 };
 
 export type CameraUpdateInput = Partial<CameraCreateInput> & {
@@ -159,6 +183,7 @@ export type CameraDetectionScanRequest = {
 
 export type CameraDetectionScanSummary = {
   detection_type: string;
+  object_label?: string | null;
   confidence: number;
   track_id: string | null;
   recognition_status: string | null;
@@ -190,14 +215,29 @@ export type CameraDetectionScanResponse = {
   callback_delivered: boolean;
 };
 
+export type CameraDetectionOverlay = CameraDetectionScanSummary & {
+  incident_id: string | null;
+  occurred_at: string;
+};
+
+export type CameraDetectionOverlayResponse = {
+  camera_id: string;
+  generated_at: string;
+  overlays: CameraDetectionOverlay[];
+};
+
 export type Incident = {
   id: string;
   camera_id: string;
   detection_type: DetectionType;
   priority: IncidentPriority;
   status: IncidentStatus;
+  retention_class: IncidentRetentionClass;
   confidence: number;
   occurred_at: string;
+  retention_expires_at: string | null;
+  legal_hold: boolean;
+  legal_hold_reason: string | null;
   bounding_boxes: Array<Record<string, unknown>>;
   snapshot_path: string | null;
   clip_path: string | null;
@@ -205,6 +245,11 @@ export type Incident = {
   operator_notes: string | null;
   assigned_user_id: string | null;
   metadata: Record<string, unknown>;
+  archived_at: string | null;
+  deletion_requested_at: string | null;
+  deletion_started_at: string | null;
+  deletion_completed_at: string | null;
+  deletion_error: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -268,6 +313,9 @@ export type PersonUpdateInput = Partial<PersonCreateInput>;
 export type IncidentUpdateInput = Partial<{
   priority: IncidentPriority;
   status: IncidentStatus;
+  retention_class: IncidentRetentionClass | null;
+  legal_hold: boolean;
+  legal_hold_reason: string | null;
   operator_notes: string | null;
   assigned_user_id: string | null;
   metadata: Record<string, unknown>;
@@ -310,6 +358,10 @@ export type LiveEvent = {
   priority?: IncidentPriority;
   status?: IncidentStatus;
   role?: UserRole;
+  camera_name?: string;
+  confidence?: number;
+  scan_count?: number;
+  message?: string;
 };
 
 export type MonitoringKpis = {
@@ -471,6 +523,9 @@ export type AuditLogPage = {
   offset: number;
 };
 
+export const PERSON_FACE_UPLOAD_MAX_FILES = 5;
+export const PERSON_FACE_UPLOAD_MAX_FILE_BYTES = 10 * 1024 * 1024;
+
 const configuredApiUrl = process.env.NEXT_PUBLIC_API_URL;
 const defaultApiUrl = "http://127.0.0.1:8000";
 const proxyApiUrl = "/backend";
@@ -499,34 +554,49 @@ function resolveWebSocketUrl(accessToken: string) {
 }
 
 async function apiFetch<T>(path: string, init?: RequestInit & { token?: string }): Promise<T> {
-  const headers = new Headers(init?.headers);
-
-  if (init?.token) {
-    headers.set("Authorization", `Bearer ${init.token}`);
+  const response = await sendApiRequest(path, init);
+  if (response.status === 401 && path !== "/api/v1/auth/refresh" && path !== "/api/v1/auth/login") {
+    const refreshed = await sendApiRequest("/api/v1/auth/refresh", { method: "POST" });
+    if (refreshed.ok) {
+      return parseApiResponse<T>(await sendApiRequest(path, init));
+    }
   }
 
-  if (!headers.has("Content-Type") && init?.body) {
+  return parseApiResponse<T>(response);
+}
+
+async function sendApiRequest(path: string, init?: RequestInit & { token?: string }): Promise<Response> {
+  const headers = new Headers(init?.headers);
+
+  if (!headers.has("Content-Type") && init?.body && !(init.body instanceof FormData)) {
     headers.set("Content-Type", "application/json");
+  }
+
+  if (init?.token && init.token !== "cookie" && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${init.token}`);
   }
 
   let response: Response;
   try {
+    const { token, ...requestInit } = init ?? {};
+    void token;
     response = await fetch(`${resolveApiUrl()}${path}`, {
-      ...init,
+      ...requestInit,
       headers,
+      credentials: "include",
       cache: "no-store"
     });
   } catch {
     throw new Error(apiUnavailableMessage);
   }
 
+  return response;
+}
+
+async function parseApiResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const fallback = response.status === 401 ? "Session expired" : "Request failed";
-    let detail = fallback;
-    try {
-      const payload = (await response.json()) as { detail?: string };
-      detail = payload.detail ?? fallback;
-    } catch {}
+    const detail = await readErrorDetail(response, fallback);
     if (detail === fallback && response.status >= 500) {
       throw new Error(apiUnavailableMessage);
     }
@@ -563,6 +633,12 @@ export async function login(email: string, password: string): Promise<TokenPair>
   });
 }
 
+export async function logoutSession(): Promise<void> {
+  return apiFetch<void>("/api/v1/auth/logout", {
+    method: "POST"
+  });
+}
+
 export async function signup(payload: SignupInput): Promise<TokenPair> {
   return apiFetch<TokenPair>("/api/v1/auth/signup", {
     method: "POST",
@@ -570,7 +646,21 @@ export async function signup(payload: SignupInput): Promise<TokenPair> {
   });
 }
 
-export async function fetchCurrentUser(accessToken: string): Promise<CurrentUser> {
+export async function requestPasswordReset(email: string): Promise<PasswordResetMessage> {
+  return apiFetch<PasswordResetMessage>("/api/v1/auth/forgot-password", {
+    method: "POST",
+    body: JSON.stringify({ email })
+  });
+}
+
+export async function resetPassword(token: string, password: string): Promise<PasswordResetMessage> {
+  return apiFetch<PasswordResetMessage>("/api/v1/auth/reset-password", {
+    method: "POST",
+    body: JSON.stringify({ token, password })
+  });
+}
+
+export async function fetchCurrentUser(accessToken?: string): Promise<CurrentUser> {
   return apiFetch<CurrentUser>("/api/v1/auth/me", { token: accessToken });
 }
 
@@ -609,6 +699,16 @@ export async function createCamera(accessToken: string, payload: CameraCreateInp
   });
 }
 
+export async function uploadCameraMedia(accessToken: string, file: File) {
+  const formData = new FormData();
+  formData.append("media", file, file.name);
+  return apiFetch<CameraMediaUpload>("/api/v1/cameras/media", {
+    method: "POST",
+    token: accessToken,
+    body: formData
+  });
+}
+
 export async function getCamera(accessToken: string, cameraId: string) {
   return apiFetch<Camera>(`/api/v1/cameras/${cameraId}`, { token: accessToken });
 }
@@ -630,6 +730,10 @@ export async function deleteCamera(accessToken: string, cameraId: string) {
 
 export async function getCameraStream(accessToken: string, cameraId: string) {
   return apiFetch<CameraStreamDescriptor>(`/api/v1/cameras/${cameraId}/stream`, { token: accessToken });
+}
+
+export async function getCameraDetectionOverlays(accessToken: string, cameraId: string) {
+  return apiFetch<CameraDetectionOverlayResponse>(`/api/v1/cameras/${cameraId}/overlays`, { token: accessToken });
 }
 
 export async function testCameraConnection(accessToken: string, cameraId: string) {
@@ -656,6 +760,26 @@ export async function runCameraDetectionScan(
   });
 }
 
+export async function runCameraLiveDetectionScan(
+  accessToken: string,
+  cameraId: string,
+  payload: CameraDetectionScanRequest
+) {
+  return apiFetch<CameraDetectionScanResponse>(`/api/v1/cameras/${cameraId}/live-scan`, {
+    method: "POST",
+    token: accessToken,
+    body: JSON.stringify({
+      // Continuous preview frames are transient. Persisting a full snapshot and
+      // face crop on every pass adds large base64/database overhead and delays
+      // the next current-frame result.
+      include_evidence: false,
+      recognition_enabled: true,
+      requested_detectors: ["weapon", "person", "fire", "smoke"],
+      ...payload
+    })
+  });
+}
+
 export async function testLiveMonitorConnections(
   accessToken: string,
   filters?: Partial<{
@@ -673,10 +797,14 @@ export async function testLiveMonitorConnections(
 }
 
 export async function fetchProtectedMedia(accessToken: string, path: string) {
+  const headers = new Headers();
+  if (accessToken !== "cookie") {
+    headers.set("Authorization", `Bearer ${accessToken}`);
+  }
+
   const response = await fetch(`${resolveApiUrl()}${path}`, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`
-    },
+    headers,
+    credentials: "include",
     cache: "no-store"
   });
 
@@ -717,6 +845,13 @@ export async function updateIncident(accessToken: string, incidentId: string, pa
     method: "PATCH",
     token: accessToken,
     body: JSON.stringify(payload)
+  });
+}
+
+export async function deleteIncident(accessToken: string, incidentId: string) {
+  return apiFetch<void>(`/api/v1/incidents/${incidentId}`, {
+    method: "DELETE",
+    token: accessToken
   });
 }
 
@@ -802,6 +937,25 @@ export async function createUser(accessToken: string, payload: UserCreateInput) 
   });
 }
 
+export async function getUser(accessToken: string, userId: string) {
+  return apiFetch<CurrentUser>(`/api/v1/users/${userId}`, { token: accessToken });
+}
+
+export async function updateUser(accessToken: string, userId: string, payload: UserUpdateInput) {
+  return apiFetch<CurrentUser>(`/api/v1/users/${userId}`, {
+    method: "PATCH",
+    token: accessToken,
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function deleteUser(accessToken: string, userId: string) {
+  return apiFetch<void>(`/api/v1/users/${userId}`, {
+    method: "DELETE",
+    token: accessToken
+  });
+}
+
 export async function listPersons(accessToken: string) {
   return apiFetch<Person[]>("/api/v1/persons", { token: accessToken });
 }
@@ -841,6 +995,13 @@ export async function updatePerson(accessToken: string, personId: string, payloa
   });
 }
 
+export async function deletePerson(accessToken: string, personId: string) {
+  return apiFetch<void>(`/api/v1/persons/${personId}`, {
+    method: "DELETE",
+    token: accessToken
+  });
+}
+
 export async function enrollPersonFace(accessToken: string, personId: string, payload: PersonFaceEnrollmentInput) {
   return apiFetch<Person>(`/api/v1/persons/${personId}/faces`, {
     method: "POST",
@@ -854,28 +1015,35 @@ export async function enrollPersonFace(accessToken: string, personId: string, pa
 }
 
 export async function uploadPersonFaceImages(accessToken: string, personId: string, payload: PersonFaceUploadInput) {
+  validatePersonFaceUpload(payload);
+
   const formData = new FormData();
   payload.files.forEach((file) => {
     formData.append("files", file);
   });
   formData.append("is_primary", String(payload.is_primary ?? false));
 
+  const headers = new Headers();
+  if (accessToken !== "cookie") {
+    headers.set("Authorization", `Bearer ${accessToken}`);
+  }
+
   const response = await fetch(`${resolveApiUrl()}/api/v1/persons/${personId}/faces/upload`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`
-    },
+    headers,
+    credentials: "include",
     body: formData,
     cache: "no-store"
   });
 
   if (!response.ok) {
-    const fallback = response.status === 401 ? "Session expired" : "Unable to upload face images";
-    let detail = fallback;
-    try {
-      const payload = (await response.json()) as { detail?: string };
-      detail = payload.detail ?? fallback;
-    } catch {}
+    const fallback =
+      response.status === 401
+        ? "Session expired"
+        : response.status === 413
+          ? `Face image upload is too large. Select up to ${PERSON_FACE_UPLOAD_MAX_FILES} images, each ${formatMegabytes(PERSON_FACE_UPLOAD_MAX_FILE_BYTES)} or smaller.`
+          : "Unable to upload face images";
+    const detail = await readErrorDetail(response, fallback);
     if (detail === fallback && response.status >= 500) {
       throw new Error(apiUnavailableMessage);
     }
@@ -883,6 +1051,55 @@ export async function uploadPersonFaceImages(accessToken: string, personId: stri
   }
 
   return response.json() as Promise<Person>;
+}
+
+export function validatePersonFaceUpload(payload: PersonFaceUploadInput) {
+  if (payload.files.length > PERSON_FACE_UPLOAD_MAX_FILES) {
+    throw new Error(`Select up to ${PERSON_FACE_UPLOAD_MAX_FILES} face images at a time.`);
+  }
+
+  const oversizedFile = payload.files.find((file) => file.size > PERSON_FACE_UPLOAD_MAX_FILE_BYTES);
+  if (oversizedFile) {
+    throw new Error(
+      `${oversizedFile.name || "Face image"} is too large. Each image must be ${formatMegabytes(PERSON_FACE_UPLOAD_MAX_FILE_BYTES)} or smaller.`
+    );
+  }
+}
+
+function formatMegabytes(bytes: number) {
+  return `${Math.floor(bytes / (1024 * 1024))} MB`;
+}
+
+async function readErrorDetail(response: Response, fallback: string) {
+  try {
+    const payload = (await response.json()) as { detail?: unknown };
+    return formatErrorDetail(payload.detail, fallback);
+  } catch {
+    return fallback;
+  }
+}
+
+function formatErrorDetail(detail: unknown, fallback: string): string {
+  if (typeof detail === "string" && detail.trim()) {
+    return detail;
+  }
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => {
+        if (typeof item === "string") {
+          return item;
+        }
+        if (item && typeof item === "object" && "msg" in item && typeof item.msg === "string") {
+          return item.msg;
+        }
+        return null;
+      })
+      .filter((message): message is string => Boolean(message));
+    if (messages.length > 0) {
+      return messages.join("; ");
+    }
+  }
+  return fallback;
 }
 
 export function subscribeToLiveEvents(

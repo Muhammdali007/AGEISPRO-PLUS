@@ -6,6 +6,7 @@ Create Date: 2026-07-06
 """
 
 from collections.abc import Sequence
+from datetime import UTC, datetime
 import json
 from uuid import uuid4
 
@@ -65,7 +66,23 @@ def upgrade() -> None:
 
     rows = bind.execute(sa.text("SELECT id, full_name, face_profiles FROM persons")).mappings()
     for row in rows:
-        for profile in row["face_profiles"] or []:
+        profiles = row["face_profiles"] or []
+        if isinstance(profiles, str):
+            try:
+                profiles = json.loads(profiles)
+            except json.JSONDecodeError:
+                profiles = []
+        if isinstance(profiles, dict):
+            profiles = list(profiles.values())
+
+        for profile in profiles:
+            if isinstance(profile, str):
+                try:
+                    profile = json.loads(profile)
+                except json.JSONDecodeError:
+                    continue
+            if not isinstance(profile, dict):
+                continue
             vector = profile.get("embedding_vector") or []
             if not vector:
                 continue
@@ -96,7 +113,7 @@ def upgrade() -> None:
                         :embedding_model,
                         :is_primary,
                         CAST(:metadata AS JSON),
-                        NOW()
+                        :created_at
                     WHERE NOT EXISTS (
                         SELECT 1 FROM person_face_embeddings WHERE face_profile_id = :face_profile_id
                     )
@@ -113,6 +130,7 @@ def upgrade() -> None:
                     "embedding_model": profile.get("embedding_model"),
                     "is_primary": bool(profile.get("is_primary")),
                     "metadata": json.dumps(profile.get("metadata") or {}),
+                    "created_at": datetime.now(UTC),
                 },
             )
 

@@ -45,7 +45,7 @@ class AlertRepository:
     async def create(self, payload: AlertCreate) -> Alert:
         alert = Alert(**payload.model_dump())
         self.session.add(alert)
-        await self.session.commit()
+        await self.session.flush()
         await self.session.refresh(alert)
         return alert
 
@@ -54,12 +54,12 @@ class AlertRepository:
         alert.status = AlertStatus.acknowledged
         alert.acknowledged_by_id = user_id
         alert.acknowledged_at = datetime.now(UTC)
-        await self.session.commit()
+        await self.session.flush()
         await self.session.refresh(alert)
         return alert
 
     async def clear(self, alert: Alert) -> Alert:
         alert.status = AlertStatus.cleared
-        await self.session.commit()
+        await self.session.flush()
         await self.session.refresh(alert)
         return alert

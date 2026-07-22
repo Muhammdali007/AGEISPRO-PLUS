@@ -4,7 +4,7 @@
   "scissors": "scissors",
   "pistol": "pistol",
   "handgun": "pistol",
-  "gun": "gun",
-  "rifle": "gun",
-  "firearm": "gun"
+  "gun": "firearm",
+  "rifle": "rifle",
+  "firearm": "firearm"
 }

@@ -32,7 +32,7 @@ class AuditLogRepository:
             metadata_=metadata or {},
         )
         self.session.add(entry)
-        await self.session.commit()
+        await self.session.flush()
         await self.session.refresh(entry)
         return entry
 

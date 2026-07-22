@@ -90,7 +90,7 @@ async def get_optimization_report(
     return await optimization.report()
 
 
-@router.get("/audit-logs", response_model=AuditLogPage)
+@router.get("/audit-logs", response_model=AuditLogPage, response_model_by_alias=False)
 async def get_audit_logs(
     action: str | None = None,
     actor_email: str | None = None,
@@ -103,8 +103,6 @@ async def get_audit_logs(
         require_roles(
             UserRole.administrator,
             UserRole.supervisor,
-            UserRole.operator,
-            UserRole.viewer,
         )
     ),
     monitoring: MonitoringService = Depends(get_monitoring_service),

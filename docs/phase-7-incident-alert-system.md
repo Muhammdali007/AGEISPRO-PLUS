@@ -42,6 +42,24 @@ evidence, alert lifecycle actions, and live event fan-out.
   `EvidenceStorageService`, which rejects files outside the configured storage
   root before returning a `FileResponse`.
 
+## Retention and deletion
+
+- Incidents use documented retention classes: `standard` archives after
+  `API_INCIDENT_RETENTION_HOURS`, `extended` after
+  `API_INCIDENT_EXTENDED_RETENTION_HOURS`, `compliance` after
+  `API_INCIDENT_COMPLIANCE_RETENTION_HOURS`, and `manual` never archives
+  automatically.
+- Critical incidents default to `compliance`, but automatic cleanup still skips
+  every critical incident and every incident that is not `resolved` or
+  `dismissed`.
+- Legal holds exclude incidents from automatic archive and evidence deletion.
+- Archive is a soft-delete: incident rows stay in the database with
+  `archived_at` and `deletion_requested_at`, related alerts are cleared rather
+  than removed, and evidence files are deleted later by the retention worker.
+- Evidence deletion is idempotent and asynchronous. A retry can safely process
+  a previously removed incident directory, then clears evidence paths and marks
+  `deletion_completed_at`.
+
 ## Alert workflow and live events
 
 - Incident-linked alerts can be listed from either the global alerts feed or
@@ -50,7 +68,10 @@ evidence, alert lifecycle actions, and live event fan-out.
 - Incident updates publish `incident.updated` events.
 - Alert creation, acknowledgement, and clearing publish alert lifecycle events.
 - Websocket clients receive an initial `system.connected` payload after
-  authentication, then live `incident.*` and `alert.*` events as they occur.
+  authentication, then live `incident.*`, `alert.*`, and confirmed `sound.alert`
+  events as they occur.
+- Weapon, fire, and smoke sound events are immediate and rate-limited. Unknown
+  people produce a sound event only after three consecutive person scans.
 
 ## Frontend outcomes
 

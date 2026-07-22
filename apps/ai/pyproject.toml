@@ -12,6 +12,9 @@ dependencies = [
 
 [project.optional-dependencies]
 model = [
+  "lapx>=0.5.2",
+  "openvino>=2025.3.0",
+  "pyyaml>=6.0",
   "ultralytics>=8.3.0"
 ]
 recognition = [
@@ -20,6 +23,7 @@ recognition = [
   "onnxruntime>=1.18.1"
 ]
 dev = [
+  "numpy>=1.26.4",
   "pytest>=8.3.2",
   "ruff>=0.6.2"
 ]

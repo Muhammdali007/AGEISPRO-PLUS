@@ -2,8 +2,9 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.core.audit import redact_audit_metadata
 from app.models.camera import CameraStatus
 
 
@@ -72,6 +73,9 @@ class AiRuntimeHealth(BaseModel):
     gpu_utilization_percent: float | None = None
     telemetry_supported: bool
     detail: str | None = None
+    runtime: dict[str, Any] = Field(default_factory=dict)
+    capacity: dict[str, Any] = Field(default_factory=dict)
+    validation_gates: dict[str, Any] = Field(default_factory=dict)
 
 
 class SystemDependencyStatus(BaseModel):
@@ -124,6 +128,8 @@ class RuntimeOptimizationReport(BaseModel):
     gpu_memory_used_mb: int | None = None
     gpu_memory_total_mb: int | None = None
     detail: str | None = None
+    capacity: dict[str, Any] = Field(default_factory=dict)
+    validation_gates: dict[str, Any] = Field(default_factory=dict)
 
 
 class OptimizationRecommendation(BaseModel):
@@ -162,6 +168,12 @@ class AuditLogEntry(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True, serialize_by_alias=False)
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def redact_sensitive_metadata(cls, value: Any) -> dict[str, Any]:
+        redacted = redact_audit_metadata(value or {})
+        return redacted if isinstance(redacted, dict) else {}
 
 
 class AuditLogPage(BaseModel):

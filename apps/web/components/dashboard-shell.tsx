@@ -14,9 +14,10 @@ import {
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import type { ReactNode } from "react";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { Button } from "@/components/button";
-import { fetchCurrentUser, subscribeToLiveEvents, type LiveEvent } from "@/lib/api";
+import { SoundAlertSystem, type SoundAlertSystemHandle } from "@/components/sound-alert-system";
+import { fetchCurrentUser, logoutSession, subscribeToLiveEvents, type LiveEvent } from "@/lib/api";
 import { labelize, statusTone } from "@/lib/format";
 import { useAuthStore } from "@/lib/auth-store";
 import { cn } from "@/lib/cn";
@@ -34,6 +35,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
   const queryClient = useQueryClient();
+  const soundAlertSystemRef = useRef<SoundAlertSystemHandle | null>(null);
   const { accessToken, hydrated, user, setUser, hydrate, logout } = useAuthStore();
 
   useEffect(() => {
@@ -78,7 +80,12 @@ export function DashboardShell({ children }: { children: ReactNode }) {
       subscribeToLiveEvents(
         accessToken,
         (event: LiveEvent) => {
+          soundAlertSystemRef.current?.handleEvent(event);
           if (event.type === "system.connected") {
+            return;
+          }
+
+          if (event.type === "sound.alert") {
             return;
           }
 
@@ -87,6 +94,9 @@ export function DashboardShell({ children }: { children: ReactNode }) {
           if (event.incident_id) {
             void queryClient.invalidateQueries({ queryKey: ["incident", event.incident_id] });
             void queryClient.invalidateQueries({ queryKey: ["incident-alerts", event.incident_id] });
+          }
+          if (event.camera_id) {
+            void queryClient.invalidateQueries({ queryKey: ["camera-overlays", event.camera_id] });
           }
         },
         () => {
@@ -162,7 +172,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
               <span className={cn("rounded-full px-3 py-1 text-xs font-medium", statusTone(user?.role ?? "viewer"))}>
                 {labelize(user?.role ?? "viewer")}
               </span>
-              <Button variant="ghost" onClick={() => logoutAndRedirect(logout, router)}>
+              <Button variant="ghost" onClick={() => void logoutAndRedirect(logout, router)}>
                 <LogOut size={16} aria-hidden="true" />
                 Sign out
               </Button>
@@ -178,6 +188,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
                 <h1 className="mt-2 text-2xl font-semibold">Live operations workspace</h1>
               </div>
               <div className="flex flex-wrap items-center gap-3">
+                <SoundAlertSystem ref={soundAlertSystemRef} />
                 <div className="flex h-11 items-center gap-2 rounded-full border border-white/10 bg-black/20 px-4 lg:hidden">
                   <BellRing size={16} aria-hidden="true" className="text-accent" />
                   <span className="text-sm text-slate-300">{user?.full_name}</span>
@@ -208,7 +219,10 @@ function DashboardLoadingState() {
   );
 }
 
-function logoutAndRedirect(logout: () => void, router: ReturnType<typeof useRouter>) {
+async function logoutAndRedirect(logout: () => void, router: ReturnType<typeof useRouter>) {
+  try {
+    await logoutSession();
+  } catch {}
   logout();
   router.replace("/login");
 }

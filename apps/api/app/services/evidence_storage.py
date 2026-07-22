@@ -57,6 +57,23 @@ class EvidenceStorageService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Evidence file not found")
         return path
 
+    def delete_incident_directory(self, *, camera_id: UUID, incident_id: UUID) -> None:
+        directory = self.resolve_relative_path(
+            (Path("incidents") / str(camera_id) / str(incident_id)).as_posix()
+        )
+        if not directory.exists():
+            return
+        if directory.is_file():
+            directory.unlink(missing_ok=True)
+            return
+
+        for path in sorted(directory.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink(missing_ok=True)
+            elif path.is_dir():
+                path.rmdir()
+        directory.rmdir()
+
     def _is_within_root(self, candidate: Path) -> bool:
         try:
             candidate.relative_to(self.storage_root)

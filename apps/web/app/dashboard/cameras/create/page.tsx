@@ -9,17 +9,18 @@ import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { CameraForm, buildCameraPayload, type CameraFormValues } from "@/components/camera-form";
 import { EmptyState, SectionCard } from "@/components/dashboard-ui";
-import { createCamera } from "@/lib/api";
+import { createCamera, uploadCameraMedia } from "@/lib/api";
 import { useAuthStore } from "@/lib/auth-store";
-import { cameraFormSchema } from "@/lib/camera-schema";
+import { buildCameraFormSchema } from "@/lib/camera-schema";
 
 export default function CreateCameraPage() {
   const router = useRouter();
   const queryClient = useQueryClient();
   const { accessToken, user, logout } = useAuthStore();
   const [error, setError] = useState<string | null>(null);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const form = useForm<CameraFormValues>({
-    resolver: zodResolver(cameraFormSchema),
+    resolver: zodResolver(buildCameraFormSchema({ requireSource: true })),
     defaultValues: {
       name: "",
       registration_role: user?.role ?? "operator",
@@ -40,7 +41,21 @@ export default function CreateCameraPage() {
         throw new Error("You need to sign in again before registering a camera.");
       }
 
-      return createCamera(accessToken, buildCameraPayload(values, user?.email));
+      const payload = buildCameraPayload(values, user?.email);
+      if (values.source_type === "file") {
+        if (!selectedFile) {
+          throw new Error("Choose a video or image file before registering this camera.");
+        }
+        const uploaded = await uploadCameraMedia(accessToken, selectedFile);
+        payload.source = uploaded.source;
+        payload.metadata = {
+          ...payload.metadata,
+          original_filename: uploaded.filename,
+          media_content_type: uploaded.content_type,
+          media_size_bytes: uploaded.size
+        };
+      }
+      return createCamera(accessToken, payload);
     },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["cameras", "list", accessToken] });
@@ -93,6 +108,10 @@ export default function CreateCameraPage() {
           isSubmitting={createCameraMutation.isPending}
           submitLabel="Add camera"
           submittingLabel="Adding camera"
+          sourceFieldHint="Credentials in camera URIs are encrypted server-side and only a redacted descriptor is shown after save."
+          enableFileUpload
+          selectedFile={selectedFile}
+          onFileSelected={setSelectedFile}
           onCancel={() => router.push("/dashboard/cameras")}
           onSubmit={onSubmit}
         />

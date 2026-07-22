@@ -29,6 +29,11 @@ export function CameraForm({
   isSubmitting,
   submitLabel,
   submittingLabel,
+  sourceFieldLabel = "Source",
+  sourceFieldHint,
+  enableFileUpload = false,
+  selectedFile = null,
+  onFileSelected,
   onCancel,
   onSubmit
 }: {
@@ -37,6 +42,11 @@ export function CameraForm({
   isSubmitting: boolean;
   submitLabel: string;
   submittingLabel: string;
+  sourceFieldLabel?: string;
+  sourceFieldHint?: string | null;
+  enableFileUpload?: boolean;
+  selectedFile?: File | null;
+  onFileSelected?: (file: File | null) => void;
   onCancel: () => void;
   onSubmit: (values: CameraFormValues) => void | Promise<void>;
 }) {
@@ -44,6 +54,7 @@ export function CameraForm({
     control: form.control,
     name: "source_type"
   });
+  const sourceTypeRegistration = form.register("source_type");
 
   return (
     <form className="grid gap-5 lg:grid-cols-2" onSubmit={form.handleSubmit(onSubmit)}>
@@ -71,7 +82,12 @@ export function CameraForm({
       <FormField label="Source type" error={form.formState.errors.source_type?.message}>
         <select
           className="h-11 w-full rounded-md border border-border bg-background px-3 text-sm outline-none transition focus:border-accent"
-          {...form.register("source_type")}
+          {...sourceTypeRegistration}
+          onChange={(event) => {
+            void sourceTypeRegistration.onChange(event);
+            form.setValue("source", "", { shouldDirty: true, shouldValidate: false });
+            onFileSelected?.(null);
+          }}
         >
           {cameraSourceTypes.map((sourceType) => (
             <option key={sourceType} value={sourceType}>
@@ -81,13 +97,29 @@ export function CameraForm({
         </select>
       </FormField>
 
-      <FormField label="Source" error={form.formState.errors.source?.message}>
-        <input
-          className="h-11 w-full rounded-md border border-border bg-background px-3 text-sm outline-none transition focus:border-accent"
-          type="text"
-          placeholder={sourcePlaceholder(selectedSourceType)}
-          {...form.register("source")}
-        />
+      <FormField label={selectedSourceType === "file" && enableFileUpload ? "Video or image file" : sourceFieldLabel} error={form.formState.errors.source?.message} hint={sourceFieldHint}>
+        {selectedSourceType === "file" && enableFileUpload ? (
+          <>
+            <input
+              className="block h-11 w-full rounded-md border border-border bg-background px-3 py-2 text-sm file:mr-3 file:rounded file:border-0 file:bg-cyan-500/15 file:px-3 file:py-1 file:text-cyan-100"
+              type="file"
+              accept="video/mp4,video/webm,video/quicktime,video/ogg,image/jpeg,image/png,image/webp,.m4v"
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0] ?? null;
+                onFileSelected?.(file);
+                form.setValue("source", file?.name ?? "", { shouldDirty: true, shouldValidate: true });
+              }}
+            />
+            {selectedFile ? <span className="mt-2 block text-xs text-slate-400">Selected: {selectedFile.name}</span> : null}
+          </>
+        ) : (
+          <input
+            className="h-11 w-full rounded-md border border-border bg-background px-3 text-sm outline-none transition focus:border-accent"
+            type="text"
+            placeholder={sourcePlaceholder(selectedSourceType)}
+            {...form.register("source")}
+          />
+        )}
       </FormField>
 
       <FormField label="Inference FPS" error={form.formState.errors.inference_fps?.message}>
@@ -201,15 +233,18 @@ export function buildCameraPayload(values: CameraFormValues, userEmail: string |
 function FormField({
   label,
   error,
+  hint,
   children
 }: {
   label: string;
   error?: string;
+  hint?: string | null;
   children: ReactNode;
 }) {
   return (
     <label className="block">
       <span className="mb-2 block text-sm text-slate-300">{label}</span>
+      {hint ? <span className="mb-2 block text-xs text-slate-500">{hint}</span> : null}
       {children}
       {error ? <span className="mt-1 block text-sm text-danger">{error}</span> : null}
     </label>
@@ -245,7 +280,7 @@ function sourceHelp(sourceType: CameraSourceType) {
     return "Use an HTTP or HTTPS stream URL. Metadata can include stream_url, stream_format, or insecure_tls for phone/webcam feeds that need extra hints.";
   }
 
-  return "Use a file path that remains inside the configured media storage root on the API server.";
+  return "Choose a local video or image. It will be uploaded into protected API media storage before the camera is registered.";
 }
 
 function metadataPlaceholder(sourceType: CameraSourceType) {
@@ -272,15 +307,16 @@ function normalizeCameraSource(source: string) {
 }
 
 function applyIpWebcamDefaults(source: string, metadata: Record<string, unknown>) {
-  if (!looksLikePrivateHttpRoot(source)) {
-    return;
+  if (looksLikePrivateHttpRoot(source)) {
+    if (typeof metadata.stream_url !== "string" || !metadata.stream_url.trim()) {
+      metadata.stream_url = `${source.replace(/\/+$/, "")}/video`;
+    }
   }
 
-  if (typeof metadata.stream_url !== "string" || !metadata.stream_url.trim()) {
-    metadata.stream_url = `${source.replace(/\/+$/, "")}/video`;
-  }
-
-  if (typeof metadata.stream_format !== "string" || !metadata.stream_format.trim()) {
+  if (
+    (looksLikePrivateHttpRoot(source) || looksLikePrivatePhoneMjpegPath(source))
+    && (typeof metadata.stream_format !== "string" || !metadata.stream_format.trim())
+  ) {
     metadata.stream_format = "mjpeg";
   }
 }
@@ -295,6 +331,23 @@ function looksLikePrivateHttpRoot(source: string) {
       return false;
     }
     return /^(localhost|127\.0\.0\.1|192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/i.test(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function looksLikePrivatePhoneMjpegPath(source: string) {
+  try {
+    const url = new URL(source);
+    if (!["http:", "https:"].includes(url.protocol)) {
+      return false;
+    }
+    if (!/^(localhost|127\.0\.0\.1|192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/i.test(url.hostname)) {
+      return false;
+    }
+
+    const normalizedPath = url.pathname.replace(/\/+$/, "").toLowerCase();
+    return ["/video", "/mjpeg", "/mjpg"].includes(normalizedPath) || /\.(mjpeg|mjpg)$/i.test(normalizedPath);
   } catch {
     return false;
   }

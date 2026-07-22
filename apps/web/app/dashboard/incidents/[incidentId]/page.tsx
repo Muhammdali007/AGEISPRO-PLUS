@@ -3,12 +3,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Image from "next/image";
 import { useEffect, useMemo, useState } from "react";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { Button } from "@/components/button";
 import { EmptyState, InlineLink, SectionCard } from "@/components/dashboard-ui";
 import {
   acknowledgeAlert,
   clearAlert,
+  deleteIncident,
   fetchIncidentClip,
   fetchIncidentSnapshot,
   getIncident,
@@ -20,7 +21,7 @@ import {
   type IncidentStatus
 } from "@/lib/api";
 import { useAuthStore } from "@/lib/auth-store";
-import { detectionTone, formatDateTime, formatPercent, labelize, statusTone } from "@/lib/format";
+import { detectionDisplayLabel, detectionTone, formatDateTime, formatPercent, labelize, statusTone } from "@/lib/format";
 import { cn } from "@/lib/cn";
 
 const incidentStatuses: IncidentStatus[] = [
@@ -33,6 +34,7 @@ const incidentStatuses: IncidentStatus[] = [
 
 export default function IncidentDetailPage() {
   const params = useParams<{ incidentId: string }>();
+  const router = useRouter();
   const queryClient = useQueryClient();
   const { accessToken, user } = useAuthStore();
   const [fullNameDraft, setFullNameDraft] = useState("");
@@ -44,6 +46,7 @@ export default function IncidentDetailPage() {
   const [title, setTitle] = useState("");
   const [saveError, setSaveError] = useState<string | null>(null);
   const [workflowError, setWorkflowError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [workflowDraft, setWorkflowDraft] = useState<Partial<Record<"status" | "operator_notes" | "assigned_user_id", string>>>({});
 
   const incidentQuery = useQuery({
@@ -83,6 +86,7 @@ export default function IncidentDetailPage() {
     !recognizedIdentity?.identity_id &&
     (incident?.detection_type === "unknown_person" || incident?.detection_type === "person") &&
     Boolean(recognizedIdentity?.face_image_path || incident?.snapshot_path);
+  const canDeleteIncident = user?.role === "administrator" || user?.role === "supervisor";
 
   const snapshotQuery = useQuery({
     queryKey: ["incident-snapshot", params.incidentId, accessToken, incident?.snapshot_path],
@@ -171,6 +175,25 @@ export default function IncidentDetailPage() {
     }
   });
 
+  const deleteIncidentMutation = useMutation({
+    mutationFn: async () => {
+      if (!accessToken || !incident) {
+        throw new Error("You need to sign in again before archiving the incident.");
+      }
+      return deleteIncident(accessToken, incident.id);
+    },
+    onSuccess: async () => {
+      setDeleteError(null);
+      await queryClient.invalidateQueries({ queryKey: ["incidents", "list", accessToken] });
+      await queryClient.invalidateQueries({ queryKey: ["alerts", "list", accessToken] });
+      queryClient.removeQueries({ queryKey: ["incident", params.incidentId, accessToken] });
+      router.push("/dashboard/incidents");
+    },
+    onError: (cause) => {
+      setDeleteError(cause instanceof Error ? cause.message : "Unable to archive incident");
+    }
+  });
+
   const selectedStatus = (workflowDraft.status as IncidentStatus | undefined) ?? incident?.status ?? "open";
   const selectedAssignee = workflowDraft.assigned_user_id ?? incident?.assigned_user_id ?? "";
   const notesValue = workflowDraft.operator_notes ?? incident?.operator_notes ?? "";
@@ -178,25 +201,50 @@ export default function IncidentDetailPage() {
   return (
     <div className="space-y-6">
       <SectionCard
-        title={incident ? `${labelize(incident.detection_type)} incident` : "Incident details"}
+        title={incident ? `${detectionDisplayLabel(incident.detection_type, incident.bounding_boxes)} incident` : "Incident details"}
         description="Phase 7 turns this route into the main operator workflow for evidence review, notes, assignment, and alert handling."
-        action={<InlineLink href="/dashboard/incidents" label="Back to incidents" />}
+        action={
+          <div className="flex flex-wrap items-center gap-3">
+            {canDeleteIncident && incident ? (
+              <Button
+                type="button"
+                variant="ghost"
+                className="border-danger/50 text-red-200 hover:bg-danger/10"
+                disabled={deleteIncidentMutation.isPending}
+                onClick={() => {
+                  setDeleteError(null);
+                  void deleteIncidentMutation.mutateAsync();
+                }}
+              >
+                {deleteIncidentMutation.isPending ? "Archiving incident" : "Archive incident"}
+              </Button>
+            ) : null}
+            <InlineLink href="/dashboard/incidents" label="Back to incidents" />
+          </div>
+        }
       >
         {incidentQuery.error instanceof Error ? (
           <EmptyState title="Incident unavailable" description={incidentQuery.error.message} />
         ) : !incident ? (
           <EmptyState title="Loading incident" description="Fetching incident, camera, alert, and evidence context from the API." />
         ) : (
-          <div className="grid gap-4 lg:grid-cols-2">
-            <DetailTile label="Camera" value={camera?.name ?? incident.camera_id} tone="bg-black/20 text-slate-200" />
-            <DetailTile label="Occurred" value={formatDateTime(incident.occurred_at)} tone="bg-black/20 text-slate-200" />
-            <DetailTile label="Detection" value={labelize(incident.detection_type)} tone={cn("bg-black/20", detectionTone(incident.detection_type))} />
-            <DetailTile label="Confidence" value={formatPercent(incident.confidence)} tone="bg-cyan-500/15 text-cyan-100" />
-            <DetailTile label="Priority" value={labelize(incident.priority)} tone={statusTone(incident.priority)} />
-            <DetailTile label="Status" value={labelize(incident.status)} tone={statusTone(incident.status)} />
-            <DetailTile label="Assigned operator" value={assignedUser?.full_name ?? "Unassigned"} tone="bg-black/20 text-slate-200" />
-            <DetailTile label="Alerts attached" value={`${relatedAlerts.length}`} tone="bg-black/20 text-slate-200" />
-          </div>
+          <>
+            {deleteError ? (
+              <div className="mb-4 rounded-md border border-danger/50 bg-danger/10 px-3 py-2 text-sm text-red-200">
+                {deleteError}
+              </div>
+            ) : null}
+            <div className="grid gap-4 lg:grid-cols-2">
+              <DetailTile label="Camera" value={camera?.name ?? incident.camera_id} tone="bg-black/20 text-slate-200" />
+              <DetailTile label="Occurred" value={formatDateTime(incident.occurred_at)} tone="bg-black/20 text-slate-200" />
+              <DetailTile label="Detection" value={detectionDisplayLabel(incident.detection_type, incident.bounding_boxes)} tone={cn("bg-black/20", detectionTone(incident.detection_type))} />
+              <DetailTile label="Confidence" value={formatPercent(incident.confidence)} tone="bg-cyan-500/15 text-cyan-100" />
+              <DetailTile label="Priority" value={labelize(incident.priority)} tone={statusTone(incident.priority)} />
+              <DetailTile label="Status" value={labelize(incident.status)} tone={statusTone(incident.status)} />
+              <DetailTile label="Assigned operator" value={assignedUser?.full_name ?? "Unassigned"} tone="bg-black/20 text-slate-200" />
+              <DetailTile label="Alerts attached" value={`${relatedAlerts.length}`} tone="bg-black/20 text-slate-200" />
+            </div>
+          </>
         )}
       </SectionCard>
 

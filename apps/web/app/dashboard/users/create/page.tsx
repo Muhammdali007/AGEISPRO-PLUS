@@ -34,8 +34,9 @@ type CreateUserForm = z.infer<typeof createUserSchema>;
 export default function CreateUserPage() {
   const router = useRouter();
   const queryClient = useQueryClient();
-  const { accessToken, user } = useAuthStore();
+  const { accessToken, user, logout } = useAuthStore();
   const [error, setError] = useState<string | null>(null);
+  const availableRoles = user?.role === "administrator" ? roles : roles.filter((role) => role !== "administrator");
   const form = useForm<CreateUserForm>({
     resolver: zodResolver(createUserSchema),
     defaultValues: {
@@ -67,6 +68,11 @@ export default function CreateUserPage() {
       router.push("/dashboard/users");
     },
     onError: (cause) => {
+      if (cause instanceof Error && (cause.message === "Invalid credentials" || cause.message === "Session expired")) {
+        logout();
+        router.push("/login");
+        return;
+      }
       setError(cause instanceof Error ? cause.message : "Unable to create user");
     }
   });
@@ -76,16 +82,16 @@ export default function CreateUserPage() {
     await createUserMutation.mutateAsync(values);
   }
 
-  if (user?.role && user.role !== "administrator") {
+  if (user?.role && user.role !== "administrator" && user.role !== "supervisor") {
     return (
       <SectionCard
         title="Create user"
-        description="Only administrators can create new accounts through the current backend contract."
+        description="Only administrators and supervisors can create new accounts through the current backend contract."
         action={<BackLink />}
       >
         <EmptyState
-          title="Administrator access required"
-          description="Your current account can view users, but only an administrator can create a new one."
+          title="Elevated access required"
+          description="Your current account can view users, but only an administrator or supervisor can create a new one."
         />
       </SectionCard>
     );
@@ -95,7 +101,7 @@ export default function CreateUserPage() {
     <div className="space-y-6">
       <SectionCard
         title="Create user"
-        description="Add a new operator account using the existing RBAC-aware backend endpoint."
+        description="Add a new account using the RBAC-aware backend endpoint."
         action={<BackLink />}
       >
         <form className="grid gap-5 lg:grid-cols-2" onSubmit={form.handleSubmit(onSubmit)}>
@@ -131,7 +137,7 @@ export default function CreateUserPage() {
               className="h-11 w-full rounded-md border border-border bg-background px-3 text-sm outline-none transition focus:border-accent"
               {...form.register("role")}
             >
-              {roles.map((role) => (
+              {availableRoles.map((role) => (
                 <option key={role} value={role}>
                   {role}
                 </option>

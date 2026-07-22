@@ -1,12 +1,14 @@
 import asyncio
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Cookie, Depends, Query, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import TokenType, decode_token
+from app.api.deps import AegisAccessCookie
+from app.core.security import TokenType, decode_token, hash_token_identifier
 from app.db.session import get_db
 from app.models.user import User, UserRole
+from app.repositories.user_sessions import UserSessionRepository
 from app.repositories.users import UserRepository
 from app.services.event_broadcaster import event_broadcaster
 
@@ -16,16 +18,24 @@ router = APIRouter()
 async def _authenticate_websocket_user(
     websocket: WebSocket,
     session: AsyncSession,
-    token: str | None,
+    access_cookie: str | None,
+    access_token: str | None,
 ) -> User | None:
-    if not token:
+    credential = access_cookie or access_token
+    if not credential:
         await websocket.close(code=4401, reason="Missing credentials")
         return None
     try:
-        payload = decode_token(token, TokenType.access)
+        payload = decode_token(credential, TokenType.access)
         user_id = UUID(payload["sub"])
+        access_jti_digest = hash_token_identifier(payload["jti"])
     except (KeyError, ValueError):
         await websocket.close(code=4401, reason="Invalid credentials")
+        return None
+
+    user_session = await UserSessionRepository(session).get_active_by_access_jti(access_jti_digest)
+    if not user_session or user_session.user_id != user_id or payload.get("sid") != str(user_session.id):
+        await websocket.close(code=4401, reason="Invalid session")
         return None
 
     user = await UserRepository(session).get_by_id(user_id)
@@ -46,10 +56,11 @@ async def _authenticate_websocket_user(
 @router.websocket("/events")
 async def event_stream(
     websocket: WebSocket,
+    access_cookie: str | None = Cookie(default=None, alias=AegisAccessCookie),
     token: str | None = Query(default=None),
     session: AsyncSession = Depends(get_db),
 ) -> None:
-    user = await _authenticate_websocket_user(websocket, session, token)
+    user = await _authenticate_websocket_user(websocket, session, access_cookie, token)
     if not user:
         return
 

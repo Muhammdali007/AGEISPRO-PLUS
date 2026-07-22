@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, require_roles
+from app.db.transactions import transaction_scope
 from app.db.session import get_db
 from app.models.alert import Alert, AlertStatus
 from app.models.incident import IncidentPriority
@@ -13,7 +14,7 @@ from app.repositories.alerts import AlertRepository
 from app.repositories.incidents import IncidentRepository
 from app.schemas.alerts import AlertCreate, AlertRead
 from app.services.audit_logs import AuditLogService
-from app.services.event_broadcaster import event_broadcaster
+from app.services.transactional_outbox import TransactionalOutboxService
 
 router = APIRouter()
 
@@ -48,7 +49,9 @@ async def create_alert(
 ) -> Alert:
     if not await IncidentRepository(session).get(payload.incident_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
-    return await AlertRepository(session).create(payload)
+    async with transaction_scope(session):
+        alert = await AlertRepository(session).create(payload)
+    return alert
 
 
 @router.post("/{alert_id}/acknowledge", response_model=AlertRead)
@@ -66,21 +69,25 @@ async def acknowledge_alert(
     alert = await alerts.get(alert_id)
     if not alert:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found")
-    updated_alert = await alerts.acknowledge(alert, current_user.id)
-    await event_broadcaster.publish(
-        {
-            "type": "alert.acknowledged",
-            "alert_id": str(updated_alert.id),
-            "incident_id": str(updated_alert.incident_id),
-        }
-    )
-    await AuditLogService(AuditLogRepository(alerts.session)).record(
-        actor=current_user,
-        action="alerts.acknowledge",
-        resource_type="alert",
-        resource_id=str(updated_alert.id),
-        metadata={"incident_id": str(updated_alert.incident_id)},
-    )
+    outbox = TransactionalOutboxService(alerts.session)
+    async with transaction_scope(alerts.session) as scope:
+        updated_alert = await alerts.acknowledge(alert, current_user.id)
+        await outbox.enqueue(
+            {
+                "type": "alert.acknowledged",
+                "alert_id": str(updated_alert.id),
+                "incident_id": str(updated_alert.incident_id),
+            }
+        )
+        await AuditLogService(AuditLogRepository(alerts.session)).record(
+            actor=current_user,
+            action="alerts.acknowledge",
+            resource_type="alert",
+            resource_id=str(updated_alert.id),
+            metadata={"incident_id": str(updated_alert.incident_id)},
+        )
+    if scope.owns_transaction:
+        await outbox.publish_pending()
     return updated_alert
 
 
@@ -99,19 +106,23 @@ async def clear_alert(
     alert = await alerts.get(alert_id)
     if not alert:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found")
-    updated_alert = await alerts.clear(alert)
-    await event_broadcaster.publish(
-        {
-            "type": "alert.cleared",
-            "alert_id": str(updated_alert.id),
-            "incident_id": str(updated_alert.incident_id),
-        }
-    )
-    await AuditLogService(AuditLogRepository(alerts.session)).record(
-        actor=current_user,
-        action="alerts.clear",
-        resource_type="alert",
-        resource_id=str(updated_alert.id),
-        metadata={"incident_id": str(updated_alert.incident_id)},
-    )
+    outbox = TransactionalOutboxService(alerts.session)
+    async with transaction_scope(alerts.session) as scope:
+        updated_alert = await alerts.clear(alert)
+        await outbox.enqueue(
+            {
+                "type": "alert.cleared",
+                "alert_id": str(updated_alert.id),
+                "incident_id": str(updated_alert.incident_id),
+            }
+        )
+        await AuditLogService(AuditLogRepository(alerts.session)).record(
+            actor=current_user,
+            action="alerts.clear",
+            resource_type="alert",
+            resource_id=str(updated_alert.id),
+            metadata={"incident_id": str(updated_alert.incident_id)},
+        )
+    if scope.owns_transaction:
+        await outbox.publish_pending()
     return updated_alert

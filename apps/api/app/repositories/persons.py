@@ -36,7 +36,7 @@ class PersonRepository:
 
     async def delete(self, person: Person) -> None:
         await self.session.delete(person)
-        await self.session.commit()
+        await self.session.flush()
 
     async def create(self, payload: PersonCreate) -> Person:
         person = Person(
@@ -49,7 +49,7 @@ class PersonRepository:
             metadata_=payload.metadata,
         )
         self.session.add(person)
-        await self.session.commit()
+        await self.session.flush()
         await self.session.refresh(person)
         return person
 
@@ -65,7 +65,7 @@ class PersonRepository:
             setattr(person, key, value)
         if payload.metadata is not None:
             person.metadata_ = payload.metadata
-        await self.session.commit()
+        await self.session.flush()
         await self.session.refresh(person)
         return person
 
@@ -88,6 +88,70 @@ class PersonRepository:
 
     async def add_face_profile(self, person: Person, payload: PersonFaceEnrollment) -> Person:
         return await self.add_face_profiles(person, [payload])
+
+    async def update_face_profile_embedding(
+        self,
+        person: Person,
+        face_profile_id: str,
+        *,
+        embedding_vector: list[float],
+        embedding_model: str | None,
+        metadata: dict[str, object],
+    ) -> Person:
+        updated_profiles: list[dict] = []
+        updated_profile: dict | None = None
+        for profile in person.face_profiles:
+            next_profile = dict(profile)
+            if profile.get("id") == face_profile_id:
+                next_profile["embedding_vector"] = embedding_vector
+                next_profile["embedding_model"] = embedding_model
+                next_profile["embedding_dimensions"] = len(embedding_vector)
+                next_profile["metadata"] = {
+                    **(profile.get("metadata") or {}),
+                    **metadata,
+                }
+                updated_profile = next_profile
+            updated_profiles.append(next_profile)
+
+        if updated_profile is None:
+            return person
+
+        person.face_profiles = updated_profiles
+        person.face_image_count = len(person.face_profiles)
+        person.embedding_count = sum(
+            1 for profile in person.face_profiles if profile.get("embedding_vector")
+        )
+
+        existing = await self.session.scalar(
+            select(PersonFaceEmbedding)
+            .where(PersonFaceEmbedding.person_id == person.id)
+            .where(PersonFaceEmbedding.face_profile_id == face_profile_id)
+        )
+        if existing is None:
+            existing = PersonFaceEmbedding(
+                person_id=person.id,
+                face_profile_id=face_profile_id,
+                label=updated_profile.get("label") or person.full_name,
+                image_path=updated_profile.get("image_path") or "",
+                embedding_literal=self._serialize_embedding(embedding_vector),
+                embedding_dimensions=len(embedding_vector),
+                embedding_model=embedding_model,
+                is_primary=bool(updated_profile.get("is_primary", False)),
+                metadata_=updated_profile.get("metadata") or {},
+            )
+            self.session.add(existing)
+        else:
+            existing.label = updated_profile.get("label") or person.full_name
+            existing.image_path = updated_profile.get("image_path") or existing.image_path
+            existing.embedding_literal = self._serialize_embedding(embedding_vector)
+            existing.embedding_dimensions = len(embedding_vector)
+            existing.embedding_model = embedding_model
+            existing.is_primary = bool(updated_profile.get("is_primary", False))
+            existing.metadata_ = updated_profile.get("metadata") or {}
+
+        await self.session.flush()
+        await self.session.refresh(person)
+        return person
 
     async def add_face_profiles(
         self, person: Person, payloads: list[PersonFaceEnrollment]
@@ -133,7 +197,7 @@ class PersonRepository:
             1 for profile in person.face_profiles if profile.get("embedding_vector")
         )
         self.session.add_all(embedding_records)
-        await self.session.commit()
+        await self.session.flush()
         await self.session.refresh(person)
         return person
 
@@ -149,7 +213,7 @@ class PersonRepository:
         person.recognition_count += 1
         person.last_seen_at = occurred_at
         person.last_recognized_at = occurred_at
-        await self.session.commit()
+        await self.session.flush()
         await self.session.refresh(person)
         return person
 

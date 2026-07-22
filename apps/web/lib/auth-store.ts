@@ -14,8 +14,9 @@ type AuthState = {
   logout: () => void;
 };
 
-const ACCESS_KEY = "aegispro.access";
-const REFRESH_KEY = "aegispro.refresh";
+const AUTH_HINT_KEY = "aegispro.authenticated";
+const ACCESS_TOKEN_KEY = "aegispro.access_token";
+const REFRESH_TOKEN_KEY = "aegispro.refresh_token";
 
 export const useAuthStore = create<AuthState>((set) => ({
   accessToken: null,
@@ -23,8 +24,9 @@ export const useAuthStore = create<AuthState>((set) => ({
   user: null,
   hydrated: false,
   setTokens: (tokens) => {
-    localStorage.setItem(ACCESS_KEY, tokens.access_token);
-    localStorage.setItem(REFRESH_KEY, tokens.refresh_token);
+    localStorage.setItem(AUTH_HINT_KEY, "true");
+    localStorage.setItem(ACCESS_TOKEN_KEY, tokens.access_token);
+    localStorage.setItem(REFRESH_TOKEN_KEY, tokens.refresh_token);
     set({
       accessToken: tokens.access_token,
       refreshToken: tokens.refresh_token,
@@ -33,17 +35,19 @@ export const useAuthStore = create<AuthState>((set) => ({
   },
   setUser: (user) => set({ user }),
   hydrate: () => {
-    const accessToken = localStorage.getItem(ACCESS_KEY);
-    const refreshToken = localStorage.getItem(REFRESH_KEY);
+    const authenticated = localStorage.getItem(AUTH_HINT_KEY) === "true";
+    const accessToken = localStorage.getItem(ACCESS_TOKEN_KEY);
+    const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY);
     set({
-      accessToken,
-      refreshToken,
+      accessToken: authenticated ? accessToken : null,
+      refreshToken: authenticated ? refreshToken : null,
       hydrated: true
     });
   },
   logout: () => {
-    localStorage.removeItem(ACCESS_KEY);
-    localStorage.removeItem(REFRESH_KEY);
+    localStorage.removeItem(AUTH_HINT_KEY);
+    localStorage.removeItem(ACCESS_TOKEN_KEY);
+    localStorage.removeItem(REFRESH_TOKEN_KEY);
     set({ accessToken: null, refreshToken: null, user: null, hydrated: true });
   }
 }));

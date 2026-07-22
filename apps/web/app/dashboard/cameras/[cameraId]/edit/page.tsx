@@ -9,9 +9,9 @@ import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { CameraForm, buildCameraPayload, type CameraFormValues } from "@/components/camera-form";
 import { EmptyState, SectionCard } from "@/components/dashboard-ui";
-import { getCamera, updateCamera } from "@/lib/api";
+import { getCamera, updateCamera, type CameraUpdateInput } from "@/lib/api";
 import { useAuthStore } from "@/lib/auth-store";
-import { cameraFormSchema } from "@/lib/camera-schema";
+import { buildCameraFormSchema } from "@/lib/camera-schema";
 
 export default function EditCameraPage() {
   const params = useParams<{ cameraId: string }>();
@@ -20,7 +20,7 @@ export default function EditCameraPage() {
   const { accessToken, user, logout } = useAuthStore();
   const [error, setError] = useState<string | null>(null);
   const form = useForm<CameraFormValues>({
-    resolver: zodResolver(cameraFormSchema),
+    resolver: zodResolver(buildCameraFormSchema({ requireSource: false })),
     defaultValues: {
       name: "",
       registration_role: user?.role ?? "operator",
@@ -51,13 +51,13 @@ export default function EditCameraPage() {
       name: cameraQuery.data.name,
       registration_role: user?.role ?? "operator",
       source_type: cameraQuery.data.source_type,
-      source: cameraQuery.data.source,
+      source: "",
       location: cameraQuery.data.location ?? "",
       group: cameraQuery.data.group ?? "",
       tags: cameraQuery.data.tags.join(", "),
       inference_fps: cameraQuery.data.inference_fps,
       detection_enabled: cameraQuery.data.detection_enabled,
-      metadata: Object.keys(cameraQuery.data.metadata).length ? JSON.stringify(cameraQuery.data.metadata, null, 2) : ""
+      metadata: ""
     });
   }, [cameraQuery.data, form, user?.role]);
 
@@ -67,7 +67,14 @@ export default function EditCameraPage() {
         throw new Error("You need to sign in again before editing this camera.");
       }
 
-      return updateCamera(accessToken, params.cameraId, buildCameraPayload(values, user?.email));
+      const payload: CameraUpdateInput = { ...buildCameraPayload(values, user?.email) };
+      if (!values.source.trim()) {
+        delete payload.source;
+      }
+      if (!values.metadata.trim()) {
+        delete payload.metadata;
+      }
+      return updateCamera(accessToken, params.cameraId, payload);
     },
     onSuccess: async () => {
       await Promise.all([
@@ -129,6 +136,10 @@ export default function EditCameraPage() {
             isSubmitting={updateCameraMutation.isPending}
             submitLabel="Save changes"
             submittingLabel="Saving changes"
+            sourceFieldLabel="Replace source"
+            sourceFieldHint={
+              `Current protected source: ${cameraQuery.data.source}. Leave this blank to keep the existing encrypted source.`
+            }
             onCancel={() => router.push(`/dashboard/cameras/${params.cameraId}`)}
             onSubmit={onSubmit}
           />

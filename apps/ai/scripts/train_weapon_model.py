@@ -19,14 +19,14 @@ MODEL_PRESETS = {
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train a production-grade weapon detector for AegisPro with Ultralytics YOLO."
+        description="Train a staged weapon detector for AegisPro with Ultralytics YOLO."
     )
     parser.add_argument("--data", required=True, type=Path, help="Path to dataset.yaml.")
     parser.add_argument(
         "--model-size",
         choices=sorted(MODEL_PRESETS),
         default="m",
-        help="Model size preset. 'm' is the recommended default for production CCTV weapon detection.",
+        help="Model size preset. 'm' is the recommended default for staged CCTV weapon evaluation.",
     )
     parser.add_argument(
         "--weights",
@@ -72,7 +72,7 @@ def main() -> None:
     best_weights = Path(result.save_dir) / "weights" / "best.pt"
     args.output_weights.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(best_weights, args.output_weights)
-    print(f"Saved production checkpoint to {args.output_weights.resolve()}")
+    print(f"Saved checkpoint to {args.output_weights.resolve()}")
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_roles
+from app.db.transactions import transaction_scope
 from app.db.session import get_db
 from app.models.incident import DetectionType, Incident, IncidentPriority, IncidentStatus
 from app.models.user import User, UserRole
@@ -16,12 +17,19 @@ from app.repositories.incidents import IncidentRepository
 from app.repositories.persons import PersonRepository
 from app.repositories.users import UserRepository
 from app.schemas.alerts import AlertRead
-from app.schemas.incidents import IncidentCreate, IncidentRead, IncidentSavePersonRequest, IncidentUpdate
-from app.services.evidence_storage import EvidenceStorageService
-from app.services.event_broadcaster import event_broadcaster
+from app.schemas.incidents import (
+    IncidentCreate,
+    IncidentRead,
+    IncidentRetentionPolicyRead,
+    IncidentSavePersonRequest,
+    IncidentUpdate,
+)
 from app.schemas.persons import PersonCreate, PersonRead
-from app.services.persons import PersonService
 from app.services.audit_logs import AuditLogService
+from app.services.evidence_storage import EvidenceStorageService
+from app.services.incident_retention_policy import get_documented_incident_retention_policies
+from app.services.persons import PersonService
+from app.services.transactional_outbox import TransactionalOutboxService
 
 router = APIRouter()
 
@@ -67,7 +75,35 @@ async def create_incident(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Camera not found")
     if payload.assigned_user_id and not await UserRepository(session).get_by_id(payload.assigned_user_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assigned user not found")
-    return await IncidentRepository(session).create(payload)
+    async with transaction_scope(session):
+        incident = await IncidentRepository(session).create(payload)
+    return incident
+
+
+@router.get(
+    "/retention-policies",
+    response_model=list[IncidentRetentionPolicyRead],
+    response_model_by_alias=False,
+)
+async def list_incident_retention_policies(
+    _: User = Depends(
+        require_roles(
+            UserRole.administrator,
+            UserRole.supervisor,
+            UserRole.operator,
+            UserRole.viewer,
+        )
+    ),
+) -> list[IncidentRetentionPolicyRead]:
+    policies = get_documented_incident_retention_policies()
+    return [
+        IncidentRetentionPolicyRead(
+            retention_class=retention_class,
+            retention_hours=policy.retention_hours,
+            description=policy.description,
+        )
+        for retention_class, policy in policies.items()
+    ]
 
 
 @router.get("/{incident_id}", response_model=IncidentRead, response_model_by_alias=False)
@@ -102,23 +138,74 @@ async def update_incident(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
     if payload.assigned_user_id and not await UserRepository(session).get_by_id(payload.assigned_user_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assigned user not found")
-    updated_incident = await incident_repository.update(incident, payload)
-    await event_broadcaster.publish(
-        {
-            "type": "incident.updated",
-            "incident_id": str(updated_incident.id),
-            "camera_id": str(updated_incident.camera_id),
-            "status": updated_incident.status.value,
-        }
-    )
-    await AuditLogService(AuditLogRepository(session)).record(
-        actor=current_user,
-        action="incidents.update",
-        resource_type="incident",
-        resource_id=str(updated_incident.id),
-        metadata=payload.model_dump(exclude_unset=True),
-    )
+    outbox = TransactionalOutboxService(session)
+    async with transaction_scope(session) as scope:
+        updated_incident = await incident_repository.update(incident, payload)
+        await outbox.enqueue(
+            {
+                "type": "incident.updated",
+                "incident_id": str(updated_incident.id),
+                "camera_id": str(updated_incident.camera_id),
+                "status": updated_incident.status.value,
+            }
+        )
+        await AuditLogService(AuditLogRepository(session)).record(
+            actor=current_user,
+            action="incidents.update",
+            resource_type="incident",
+            resource_id=str(updated_incident.id),
+            metadata=payload.model_dump(exclude_unset=True),
+        )
+    if scope.owns_transaction:
+        await outbox.publish_pending()
     return updated_incident
+
+
+@router.delete("/{incident_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_incident(
+    incident_id: UUID,
+    current_user: User = Depends(require_roles(UserRole.administrator, UserRole.supervisor)),
+    session: AsyncSession = Depends(get_db),
+) -> None:
+    incident_repository = IncidentRepository(session)
+    incident = await incident_repository.get(incident_id)
+    if not incident:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
+    if incident.legal_hold:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Incident is on legal hold and cannot be archived for deletion",
+        )
+
+    outbox = TransactionalOutboxService(session)
+    async with transaction_scope(session) as scope:
+        await AuditLogService(AuditLogRepository(session)).record(
+            actor=current_user,
+            action="incidents.delete",
+            resource_type="incident",
+            resource_id=str(incident.id),
+            metadata={
+                "camera_id": str(incident.camera_id),
+                "detection_type": incident.detection_type.value,
+                "priority": incident.priority.value,
+                "status": incident.status.value,
+                "occurred_at": incident.occurred_at.isoformat(),
+                "retention_class": incident.retention_class.value,
+                "legal_hold": incident.legal_hold,
+                "deletion_mode": "archive_then_async_delete",
+            },
+        )
+        await outbox.enqueue(
+            {
+                "type": "incident.archived",
+                "incident_id": str(incident.id),
+                "camera_id": str(incident.camera_id),
+                "status": incident.status.value,
+            }
+        )
+        await incident_repository.archive(incident)
+    if scope.owns_transaction:
+        await outbox.publish_pending()
 
 
 @router.post("/{incident_id}/save-person", response_model=PersonRead, response_model_by_alias=False)
@@ -145,60 +232,61 @@ async def save_incident_person(
 
     persons = PersonService(PersonRepository(session))
     try:
-        person = await persons.create(
-            PersonCreate(
-                full_name=payload.full_name,
-                person_type=payload.person_type,
-                department=payload.department,
-                reference_id=payload.reference_id,
-                title=payload.title,
-                is_active=payload.is_active,
-                metadata={
-                    **payload.metadata,
-                    "source_incident_id": str(incident.id),
-                    "source_camera_id": str(incident.camera_id),
-                    "source_detection_type": incident.detection_type.value,
-                },
+        async with transaction_scope(session):
+            person = await persons.create(
+                PersonCreate(
+                    full_name=payload.full_name,
+                    person_type=payload.person_type,
+                    department=payload.department,
+                    reference_id=payload.reference_id,
+                    title=payload.title,
+                    is_active=payload.is_active,
+                    metadata={
+                        **payload.metadata,
+                        "source_incident_id": str(incident.id),
+                        "source_camera_id": str(incident.camera_id),
+                        "source_detection_type": incident.detection_type.value,
+                    },
+                )
             )
-        )
+
+            try:
+                person = await persons.enroll_face_image_from_storage(
+                    person.id,
+                    image_path,
+                    label=payload.full_name,
+                    is_primary=payload.is_primary,
+                    metadata={
+                        "source_incident_id": str(incident.id),
+                        "source_camera_id": str(incident.camera_id),
+                        "source_face_image_path": image_path,
+                        "source_snapshot_path": incident.snapshot_path,
+                    },
+                )
+            except Exception:
+                await persons.delete(person.id)
+                raise
+
+            recognized_identity = dict(incident.recognized_identity or {})
+            recognized_identity.update(
+                {
+                    "status": "known",
+                    "identity_id": str(person.id),
+                    "identity_label": person.full_name,
+                    "face_image_path": person.face_profiles[-1]["image_path"] if person.face_profiles else image_path,
+                }
+            )
+            incident.detection_type = DetectionType.known_person
+            incident.recognized_identity = recognized_identity
+            incident.metadata_ = {
+                **incident.metadata_,
+                "saved_person_id": str(person.id),
+                "saved_from_incident": True,
+            }
+            await session.flush()
+            await session.refresh(incident)
     except IntegrityError:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Reference ID already exists")
-
-    try:
-        person = await persons.enroll_face_image_from_storage(
-            person.id,
-            image_path,
-            label=payload.full_name,
-            is_primary=payload.is_primary,
-            metadata={
-                "source_incident_id": str(incident.id),
-                "source_camera_id": str(incident.camera_id),
-                "source_face_image_path": image_path,
-                "source_snapshot_path": incident.snapshot_path,
-            },
-        )
-    except Exception:
-        await persons.delete(person.id)
-        raise
-
-    recognized_identity = dict(incident.recognized_identity or {})
-    recognized_identity.update(
-        {
-            "status": "known",
-            "identity_id": str(person.id),
-            "identity_label": person.full_name,
-            "face_image_path": person.face_profiles[-1]["image_path"] if person.face_profiles else image_path,
-        }
-    )
-    incident.detection_type = DetectionType.known_person
-    incident.recognized_identity = recognized_identity
-    incident.metadata_ = {
-        **incident.metadata_,
-        "saved_person_id": str(person.id),
-        "saved_from_incident": True,
-    }
-    await session.commit()
-    await session.refresh(incident)
     return person
 
 

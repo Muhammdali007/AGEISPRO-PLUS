@@ -3,14 +3,87 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Pencil, Play, Radar, Radio, RefreshCw, Square, Trash2 } from "lucide-react";
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/button";
-import { CameraStreamPanel, type CameraStreamPanelHandle } from "@/components/camera-stream-panel";
+import { CameraStreamPanel } from "@/components/camera-stream-panel";
+import type { CameraStreamPanelHandle, CapturedCameraFrame } from "@/components/camera-stream-panel";
+import type { CameraDetectionScanSummary } from "@/lib/api";
 import { EmptyState, InlineLink, SectionCard } from "@/components/dashboard-ui";
-import { deleteCamera, getCamera, getCameraStream, runCameraDetectionScan, testCameraConnection, updateCamera } from "@/lib/api";
+import { deleteCamera, getCamera, getCameraDetectionOverlays, getCameraStream, runCameraDetectionScan, runCameraLiveDetectionScan, testCameraConnection, updateCamera } from "@/lib/api";
 import { useAuthStore } from "@/lib/auth-store";
 import { formatDateTime, labelize, statusTone } from "@/lib/format";
 import { cn } from "@/lib/cn";
+
+const LIVE_DETECTION_EMPTY_GRACE_MS = 2500;
+const LIVE_WEAPON_SCAN_INTERVAL_MS = 200;
+const LIVE_HAZARD_SCAN_INTERVAL_MS = 200;
+const LIVE_PERSON_DETECTION_TYPES = new Set(["person", "known_person", "unknown_person"]);
+
+function mergeLiveDetectionFrame(
+  previous: CameraDetectionScanSummary[] | null,
+  incoming: CameraDetectionScanSummary[],
+  requestedDetectors: string[]
+) {
+  const currentThreats = incoming.filter(
+    (detection) => !LIVE_PERSON_DETECTION_TYPES.has(detection.detection_type)
+  );
+  const currentPeople = incoming.filter((detection) =>
+    LIVE_PERSON_DETECTION_TYPES.has(detection.detection_type)
+  );
+  const retainedPeople = currentPeople.length > 0
+    ? currentPeople
+    : (previous ?? []).filter((detection) =>
+        LIVE_PERSON_DETECTION_TYPES.has(detection.detection_type)
+      );
+  const requested = new Set(requestedDetectors);
+  const incomingThreatTypes = new Set(currentThreats.map((detection) => detection.detection_type));
+  const retainedUnscannedThreats = (previous ?? []).filter((detection) =>
+    !LIVE_PERSON_DETECTION_TYPES.has(detection.detection_type)
+      && !requested.has(detection.detection_type)
+      && !incomingThreatTypes.has(detection.detection_type)
+  );
+  return [...currentThreats, ...retainedUnscannedThreats, ...retainedPeople];
+}
+
+function scaleDetectionsToSource(
+  detections: CameraDetectionScanSummary[],
+  frame: CapturedCameraFrame
+) {
+  const scaleX = frame.sourceWidth / frame.width;
+  const scaleY = frame.sourceHeight / frame.height;
+  if (scaleX === 1 && scaleY === 1) {
+    return detections;
+  }
+
+  const scaleBox = (box: CameraDetectionScanSummary["bounding_box"]) => box
+    ? {
+        ...box,
+        x1: box.x1 * scaleX,
+        y1: box.y1 * scaleY,
+        x2: box.x2 * scaleX,
+        y2: box.y2 * scaleY
+      }
+    : box;
+
+  return detections.map((detection) => ({
+    ...detection,
+    bounding_box: scaleBox(detection.bounding_box),
+    face_bounding_box: scaleBox(detection.face_bounding_box)
+  }));
+}
+
+function formatLiveScanStatusMessage(
+  currentFrameCount: number,
+  visibleCount: number,
+  alertCount: number
+) {
+  const detectionLabel = visibleCount === 1 ? "detection" : "detections";
+  const alertLabel = alertCount === 1 ? "alert" : "alerts";
+  if (visibleCount !== currentFrameCount) {
+    return `Continuous AI scan active: ${visibleCount} visible ${detectionLabel} (${currentFrameCount} current-frame), ${alertCount} ${alertLabel}.`;
+  }
+  return `Continuous AI scan active: ${visibleCount} ${detectionLabel}, ${alertCount} ${alertLabel}.`;
+}
 
 export default function CameraDetailPage() {
   const params = useParams<{ cameraId: string }>();
@@ -19,6 +92,18 @@ export default function CameraDetailPage() {
   const queryClient = useQueryClient();
   const canManageCamera = user?.role === "administrator" || user?.role === "supervisor";
   const streamPanelRef = useRef<CameraStreamPanelHandle | null>(null);
+  const liveScanPendingRef = useRef(false);
+  const lastLiveWeaponScanRef = useRef(0);
+  const lastLiveHazardScanRef = useRef(0);
+  const liveDetectionsRef = useRef<CameraDetectionScanSummary[] | null>(null);
+  const [liveDetections, setLiveDetections] = useState<CameraDetectionScanSummary[] | null>(null);
+  const [liveScanStatus, setLiveScanStatus] = useState<{
+    state: "idle" | "waiting" | "scanning" | "ok" | "error";
+    message: string;
+  }>({
+    state: "idle",
+    message: "Continuous AI scanning starts when the camera preview is running."
+  });
 
   const cameraQuery = useQuery({
     queryKey: ["camera", params.cameraId, accessToken],
@@ -30,6 +115,23 @@ export default function CameraDetailPage() {
     queryKey: ["camera-stream", params.cameraId, accessToken],
     queryFn: async () => getCameraStream(accessToken!, params.cameraId),
     enabled: Boolean(accessToken && params.cameraId),
+    retry: false
+  });
+  const overlayQuery = useQuery({
+    queryKey: ["camera-overlays", params.cameraId, accessToken],
+    queryFn: async () => getCameraDetectionOverlays(accessToken!, params.cameraId),
+    enabled: Boolean(
+      accessToken
+      && params.cameraId
+      && streamQuery.data
+      && streamQuery.data.stream_kind !== "browser-camera"
+      && !(cameraQuery.data?.source_type === "file" && streamQuery.data.stream_kind !== "image")
+    ),
+    // This endpoint exposes short-lived latest-frame state, not incident
+    // history. Frequent reads are cheap and keep boxes aligned to the worker.
+    refetchInterval: cameraQuery.data?.detection_enabled
+      ? Math.max(200, Math.round(1000 / Math.max(1, cameraQuery.data.inference_fps)))
+      : 1000,
     retry: false
   });
   const testConnection = useMutation({
@@ -96,17 +198,26 @@ export default function CameraDetailPage() {
         throw new Error("You need to sign in again before running an AI scan.");
       }
 
-      const snapshot = await streamPanelRef.current?.captureFrame();
+      const frame = await streamPanelRef.current?.captureFrame();
+      if (stream?.stream_kind === "browser-camera" && !frame) {
+        throw new Error("Wait until the live preview is visible, then run the AI scan again.");
+      }
+
       return runCameraDetectionScan(accessToken, params.cameraId, {
-        frame_content_base64: snapshot?.contentBase64,
-        frame_content_type: snapshot?.contentType,
-        occurrence_hint: occurrenceHint ?? "dashboard_manual_scan"
+        ...(frame
+          ? {
+              frame_content_base64: frame.contentBase64,
+              frame_content_type: frame.contentType
+            }
+          : {}),
+        occurrence_hint: occurrenceHint ?? "privileged_manual_scan"
       });
     },
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["incidents", accessToken] }),
         queryClient.invalidateQueries({ queryKey: ["alerts", accessToken] }),
+        queryClient.invalidateQueries({ queryKey: ["camera-overlays", params.cameraId, accessToken] }),
         queryClient.invalidateQueries({ queryKey: ["camera", params.cameraId, accessToken] }),
         queryClient.invalidateQueries({ queryKey: ["cameras", "list", accessToken] })
       ]);
@@ -118,31 +229,232 @@ export default function CameraDetailPage() {
       }
     }
   });
-
   const camera = cameraQuery.data;
   const stream = streamQuery.data;
+  const usesPreviewFrameTransport = Boolean(
+    stream?.stream_kind === "browser-camera"
+    || (camera?.source_type === "file" && stream?.stream_kind !== "image")
+  );
+  // Browser-camera and recorded-file detections belong to the exact preview
+  // frame just submitted. Do not paint persisted boxes from another frame over
+  // moving media.
+  const overlays = usesPreviewFrameTransport
+    ? liveDetections ?? []
+    : overlayQuery.data?.overlays ?? [];
   const isRunning = Boolean(camera?.detection_enabled && camera.status !== "disabled");
-  const runScan = scanMutation.mutate;
-  const scanPending = scanMutation.isPending;
+  // Server-readable HTTP/RTSP/file sources are already owned by the backend
+  // worker. Only transport browser-local frames that the server cannot open.
+  const isLiveScanActive = Boolean(
+    accessToken
+    && camera
+    && usesPreviewFrameTransport
+    && canManageCamera
+    && isRunning
+  );
+  const liveScanInferenceFps = camera?.inference_fps ?? 1;
+  const displayedLiveScanStatus = !isRunning
+    ? {
+        state: "idle" as const,
+        message: "Continuous AI scanning starts when the camera is running."
+      }
+    : !usesPreviewFrameTransport
+      ? {
+          state: "ok" as const,
+          message: "Backend worker owns inference; this page consumes its latest overlay data."
+        }
+      : isLiveScanActive
+        ? liveScanStatus
+        : {
+            state: "idle" as const,
+            message: "A supervisor or administrator must keep this preview open to transport frames."
+          };
 
   useEffect(() => {
-    if (!accessToken || !stream || !isRunning) {
+    if (cameraQuery.error instanceof Error && cameraQuery.error.message.includes("Camera not found")) {
+      router.replace("/dashboard/cameras");
+    }
+  }, [cameraQuery.error, router]);
+
+  useEffect(() => {
+    if (!accessToken || !isLiveScanActive) {
+      liveScanPendingRef.current = false;
       return;
     }
 
-    const scanLiveFrame = () => {
-      if (document.visibilityState === "visible" && !scanPending) {
-        runScan("dashboard_live_scan");
+    let stopped = false;
+    const token = accessToken;
+    let overlayExpiry: number | undefined;
+    // A browser camera cannot queue frames like a media worker. Start the next
+    // scan only after the previous one completes and discard intermediate
+    // frames. This keeps inference latency from turning into video latency.
+    const intervalMs = Math.max(200, Math.round(1000 / Math.max(1, liveScanInferenceFps)));
+    let nextScan: number | undefined;
+
+    function cancelOverlayExpiry() {
+      if (overlayExpiry !== undefined) {
+        window.clearTimeout(overlayExpiry);
+        overlayExpiry = undefined;
       }
-    };
-    const initialScan = window.setTimeout(scanLiveFrame, 750);
-    const interval = window.setInterval(scanLiveFrame, 2000);
+    }
+
+    function setCurrentLiveDetections(detections: CameraDetectionScanSummary[] | null) {
+      liveDetectionsRef.current = detections;
+      setLiveDetections(detections);
+    }
+
+    function clearPeopleAfterGraceFromLiveDetections() {
+      setLiveDetections((current) => {
+        const retained = (current ?? []).filter(
+          (detection) => !LIVE_PERSON_DETECTION_TYPES.has(detection.detection_type)
+        );
+        liveDetectionsRef.current = retained;
+        return retained;
+      });
+    }
+
+    function expireOverlayAfterGrace() {
+      if (stopped || overlayExpiry !== undefined) {
+        return;
+      }
+      overlayExpiry = window.setTimeout(() => {
+        overlayExpiry = undefined;
+        if (!stopped) {
+          clearPeopleAfterGraceFromLiveDetections();
+        }
+      }, LIVE_DETECTION_EMPTY_GRACE_MS);
+    }
+
+    function scheduleNextScan(delayMs = intervalMs) {
+      if (stopped) {
+        return;
+      }
+      if (nextScan !== undefined) {
+        window.clearTimeout(nextScan);
+      }
+      nextScan = window.setTimeout(() => {
+        nextScan = undefined;
+        void scanLiveFrame();
+      }, delayMs);
+    }
+
+    async function scanLiveFrame() {
+      if (stopped) {
+        return;
+      }
+      if (liveScanPendingRef.current || document.visibilityState !== "visible") {
+        scheduleNextScan(Math.max(intervalMs, 500));
+        return;
+      }
+
+      const scanStartedAt = performance.now();
+      const frame = await streamPanelRef.current?.captureFrame();
+      if (!frame || stopped) {
+        if (!stopped) {
+          setLiveScanStatus({
+            state: "waiting",
+            message: "Waiting for a readable camera frame from the live preview."
+          });
+          scheduleNextScan(Math.max(intervalMs, 500));
+        }
+        return;
+      }
+
+      liveScanPendingRef.current = true;
+      // Once this live loop owns the overlay, never fall back to coordinates
+      // from an older persisted incident.
+      setCurrentLiveDetections(liveDetectionsRef.current ?? []);
+      setLiveScanStatus({
+        state: "scanning",
+        message: "Continuous AI scan is analyzing the latest camera frame."
+      });
+      try {
+        const scanClock = performance.now();
+        const weaponScanDue = scanClock - lastLiveWeaponScanRef.current >= LIVE_WEAPON_SCAN_INTERVAL_MS;
+        const hazardScanDue = scanClock - lastLiveHazardScanRef.current >= LIVE_HAZARD_SCAN_INTERVAL_MS;
+        if (weaponScanDue) {
+          lastLiveWeaponScanRef.current = scanClock;
+        }
+        if (hazardScanDue) {
+          lastLiveHazardScanRef.current = scanClock;
+        }
+        const requestedDetectors = [
+          "person",
+          ...(weaponScanDue ? ["weapon"] : []),
+          ...(hazardScanDue ? ["fire", "smoke"] : [])
+        ];
+        const result = await runCameraLiveDetectionScan(token, params.cameraId, {
+          frame_content_base64: frame.contentBase64,
+          frame_content_type: frame.contentType,
+          // All safety detectors share the low-latency lane. Threat candidates
+          // are visible immediately; alerts still require temporal confirmation.
+          requested_detectors: requestedDetectors,
+          occurrence_hint: "dashboard_live_scan"
+        });
+        if (!stopped) {
+          const currentDetections = scaleDetectionsToSource(result.detections, frame);
+          const mergedDetections = mergeLiveDetectionFrame(
+            liveDetectionsRef.current,
+            currentDetections,
+            requestedDetectors
+          );
+          const hasCurrentPeople = currentDetections.some((detection) =>
+            LIVE_PERSON_DETECTION_TYPES.has(detection.detection_type)
+          );
+          setCurrentLiveDetections(mergedDetections);
+          if (hasCurrentPeople) {
+            cancelOverlayExpiry();
+          } else {
+            // People receive a bounded missed-frame grace period. Threat boxes
+            // are retained only until that detector's next scheduled lane pass.
+            expireOverlayAfterGrace();
+          }
+          setLiveScanStatus({
+            state: "ok",
+            message: formatLiveScanStatusMessage(
+              result.detection_count,
+              mergedDetections.length,
+              result.alert_count
+            )
+          });
+
+          if (result.incident_count > 0 || result.alert_count > 0) {
+            void queryClient.invalidateQueries({ queryKey: ["incidents", token] });
+            void queryClient.invalidateQueries({ queryKey: ["alerts", token] });
+          }
+        }
+      } catch (cause) {
+        if (cause instanceof Error && (cause.message === "Invalid credentials" || cause.message === "Session expired")) {
+          logout();
+          router.push("/login");
+          return;
+        }
+        if (!stopped) {
+          expireOverlayAfterGrace();
+          setLiveScanStatus({
+            state: "error",
+            message: cause instanceof Error ? cause.message : "Continuous AI scan failed."
+          });
+        }
+      } finally {
+        liveScanPendingRef.current = false;
+        // Hold a start-to-start cadence. Adding the full interval after a slow
+        // response makes configured FPS drift by the inference latency itself.
+        const elapsedMs = performance.now() - scanStartedAt;
+        scheduleNextScan(Math.max(0, intervalMs - elapsedMs));
+      }
+    }
+
+    scheduleNextScan(500);
 
     return () => {
-      window.clearTimeout(initialScan);
-      window.clearInterval(interval);
+      stopped = true;
+      if (nextScan !== undefined) {
+        window.clearTimeout(nextScan);
+      }
+      cancelOverlayExpiry();
+      setCurrentLiveDetections(null);
     };
-  }, [accessToken, isRunning, runScan, scanPending, stream]);
+  }, [accessToken, isLiveScanActive, liveScanInferenceFps, logout, params.cameraId, queryClient, router]);
 
   async function handleDeleteCamera() {
     if (!window.confirm("Delete this camera? This action cannot be undone.")) {
@@ -160,18 +472,9 @@ export default function CameraDetailPage() {
     <div className="space-y-6">
       <SectionCard
         title={camera?.name ?? "Camera details"}
-        description="Phase 4 adds source-aware preview, health testing, and stream guidance without coupling browser playback to AI inference services."
+        description="Live preview consumes server-owned detection overlays while backend workers own continuous inference."
         action={
           <div className="flex flex-wrap items-center gap-3">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => scanMutation.mutate(undefined)}
-              disabled={scanMutation.isPending || !accessToken || !camera}
-            >
-              <Radar size={16} aria-hidden="true" />
-              {scanMutation.isPending ? "Scanning..." : "Run AI scan"}
-            </Button>
             <Button
               type="button"
               variant="ghost"
@@ -183,6 +486,15 @@ export default function CameraDetailPage() {
             </Button>
             {canManageCamera ? (
               <>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => scanMutation.mutate(undefined)}
+                  disabled={scanMutation.isPending || !accessToken || !camera}
+                >
+                  <Radar size={16} aria-hidden="true" />
+                  {scanMutation.isPending ? "Scanning..." : "Run manual scan"}
+                </Button>
                 <Button
                   type="button"
                   variant="ghost"
@@ -249,7 +561,7 @@ export default function CameraDetailPage() {
                     accessToken={accessToken!}
                     camera={camera}
                     stream={stream}
-                    detections={scanMutation.data?.detections ?? []}
+                    detections={overlays}
                   />
                 ) : (
                   <EmptyState
@@ -274,7 +586,19 @@ export default function CameraDetailPage() {
                       ? "bg-emerald-500/15 text-emerald-200"
                       : "bg-slate-500/20 text-slate-200"
                   }
-                  detail={isRunning ? `${camera.inference_fps} inference FPS configured` : "Camera is paused for detection and monitoring workflows"}
+                  detail={isRunning ? `${camera.inference_fps} inference FPS configured on backend worker` : "Camera is paused for detection and monitoring workflows"}
+                />
+                <HealthCard
+                  title="Continuous scan"
+                  value={labelize(displayedLiveScanStatus.state)}
+                  tone={
+                    displayedLiveScanStatus.state === "ok" || displayedLiveScanStatus.state === "scanning"
+                      ? "bg-emerald-500/15 text-emerald-200"
+                      : displayedLiveScanStatus.state === "error"
+                        ? "bg-red-500/15 text-red-200"
+                        : "bg-slate-500/20 text-slate-200"
+                  }
+                  detail={displayedLiveScanStatus.message}
                 />
                 <HealthCard
                   title="Playback mode"
@@ -322,7 +646,7 @@ export default function CameraDetailPage() {
                   {scanMutation.data.detections.length > 0
                     ? scanMutation.data.detections
                         .map((detection) =>
-                          `${labelize(detection.detection_type)} ${Math.round(detection.confidence * 100)}%${detection.identity_label ? ` (${detection.identity_label})` : ""}`
+                          `${labelize(detection.object_label || detection.detection_type)} ${Math.round(detection.confidence * 100)}%${detection.identity_label ? ` (${detection.identity_label})` : ""}`
                         )
                         .join(" | ")
                     : scanMutation.data.ignored_reasons.join(" | ") || "No detections were produced for this frame."}
@@ -350,6 +674,11 @@ export default function CameraDetailPage() {
                 tone="bg-cyan-500/15 text-cyan-100"
               />
               <DetailBlock label="Source" value={camera.source} tone="bg-black/20 text-slate-200" />
+              <DetailBlock
+                label="Credential status"
+                value={camera.credentials_rotation_required ? "Rotation required" : camera.source_redacted ? "Protected" : "Not redacted"}
+                tone={camera.credentials_rotation_required ? "bg-amber-500/15 text-amber-100" : "bg-black/20 text-slate-200"}
+              />
               <DetailBlock label="Location" value={camera.location ?? "Not set"} tone="bg-black/20 text-slate-200" />
               <DetailBlock label="Group" value={camera.group ?? "Ungrouped"} tone="bg-black/20 text-slate-200" />
               <DetailBlock label="Inference FPS" value={`${camera.inference_fps}`} tone="bg-emerald-500/15 text-emerald-200" />

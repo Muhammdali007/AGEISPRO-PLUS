@@ -11,7 +11,7 @@ from app.core.security import verify_password
 from app.db.metadata import Base
 from app.models.alert import AlertStatus
 from app.models.camera import CameraSourceType, CameraStatus
-from app.models.incident import DetectionType, IncidentPriority, IncidentStatus
+from app.models.incident import DetectionType, IncidentPriority, IncidentRetentionClass, IncidentStatus
 from app.models.user import User, UserRole
 from app.repositories.alerts import AlertRepository
 from app.repositories.cameras import CameraRepository
@@ -42,7 +42,7 @@ def test_phase_2_models_are_registered_in_metadata() -> None:
 
 
 @pytest.mark.asyncio
-async def test_user_management_create_update_and_soft_delete(session: AsyncSession) -> None:
+async def test_user_management_create_update_and_delete(session: AsyncSession) -> None:
     users = UserRepository(session)
 
     user = await users.create(
@@ -61,6 +61,10 @@ async def test_user_management_create_update_and_soft_delete(session: AsyncSessi
 
     assert updated.full_name == "Operator Updated"
     assert updated.is_active is False
+
+    await users.delete(updated)
+
+    assert await users.get_by_id(user.id) is None
 
 
 @pytest.mark.asyncio
@@ -86,6 +90,28 @@ async def test_camera_crud_and_filters(session: AsyncSession) -> None:
 
     assert updated.detection_enabled is False
     assert updated.inference_fps == 3
+
+
+@pytest.mark.asyncio
+async def test_camera_repository_encrypts_network_sources_and_preserves_runtime_source(
+    session: AsyncSession,
+) -> None:
+    cameras = CameraRepository(session)
+    raw_source = "rtsp://operator:RotateMe123!@camera.local:554/live"
+
+    camera = await cameras.create(
+        CameraCreate(
+            name="Secure Lobby",
+            source_type=CameraSourceType.rtsp,
+            source=raw_source,
+        )
+    )
+
+    assert camera.source == "rtsp://camera.local:554/...."
+    assert camera.source_redacted is True
+    assert camera.credentials_rotation_required is True
+    assert camera.secret is not None
+    assert await cameras.get_runtime_source(camera) == raw_source
 
 
 @pytest.mark.asyncio
@@ -207,13 +233,25 @@ async def test_incident_filters_and_status_update(session: AsyncSession) -> None
         assigned_user_id=user.id,
     )
     assert [item.id for item in filtered] == [incident.id]
+    assert incident.retention_class is IncidentRetentionClass.compliance
+    assert incident.retention_expires_at is not None
 
     updated = await incidents.update(
         incident,
-        IncidentUpdate(status=IncidentStatus.investigating, operator_notes="Reviewing evidence"),
+        IncidentUpdate(
+            status=IncidentStatus.investigating,
+            operator_notes="Reviewing evidence",
+            retention_class=IncidentRetentionClass.manual,
+            legal_hold=True,
+            legal_hold_reason="Pending supervisor review",
+        ),
     )
     assert updated.status is IncidentStatus.investigating
     assert updated.operator_notes == "Reviewing evidence"
+    assert updated.retention_class is IncidentRetentionClass.manual
+    assert updated.retention_expires_at is None
+    assert updated.legal_hold is True
+    assert updated.legal_hold_reason == "Pending supervisor review"
 
 
 @pytest.mark.asyncio

@@ -1,14 +1,20 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Trash2 } from "lucide-react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { Button } from "@/components/button";
 import { EmptyState, InlineLink, MetricCard, SectionCard } from "@/components/dashboard-ui";
-import { listUsers } from "@/lib/api";
+import { deleteUser, listUsers } from "@/lib/api";
 import { useAuthStore } from "@/lib/auth-store";
 import { labelize, statusTone } from "@/lib/format";
 import { cn } from "@/lib/cn";
 
 export default function UsersPage() {
-  const { accessToken, user } = useAuthStore();
+  const router = useRouter();
+  const queryClient = useQueryClient();
+  const { accessToken, user: currentUser, logout } = useAuthStore();
   const usersQuery = useQuery({
     queryKey: ["users", "list", accessToken],
     queryFn: () => listUsers(accessToken!),
@@ -16,6 +22,41 @@ export default function UsersPage() {
   });
 
   const users = usersQuery.data ?? [];
+  const canManageUsers = currentUser?.role === "administrator" || currentUser?.role === "supervisor";
+  const deleteUserMutation = useMutation({
+    mutationFn: async (userId: string) => {
+      if (!accessToken) {
+        throw new Error("You need to sign in again before deleting a user.");
+      }
+
+      await deleteUser(accessToken, userId);
+    },
+    onSuccess: async (_result, userId) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["users", "list", accessToken] }),
+        queryClient.invalidateQueries({ queryKey: ["auth", "me", accessToken] })
+      ]);
+
+      if (userId === currentUser?.id) {
+        logout();
+        router.push("/login");
+      }
+    }
+  });
+
+  async function handleDelete(userId: string, fullName: string) {
+    const confirmed = window.confirm(`Delete ${fullName}? This will permanently remove the account.`);
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      await deleteUserMutation.mutateAsync(userId);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : "Unable to delete user";
+      window.alert(message);
+    }
+  }
 
   return (
     <div className="space-y-6">
@@ -28,9 +69,9 @@ export default function UsersPage() {
 
       <SectionCard
         title="User management"
-        description="Phase 3 surfaces the role model and account inventory. Editing flows can layer onto the same contracts without redesign."
+        description="Create, update, and deactivate platform accounts with RBAC-aware access controls."
         action={
-          user?.role === "administrator" ? (
+          canManageUsers ? (
             <InlineLink href="/dashboard/users/create" label="Create user" />
           ) : undefined
         }
@@ -42,34 +83,61 @@ export default function UsersPage() {
           />
         ) : (
           <div className="space-y-3">
-            {users.map((user) => (
-              <div
-                key={user.id}
-                className="grid gap-4 rounded-[24px] border border-white/10 bg-black/15 p-4 md:grid-cols-[1.1fr_0.8fr_0.8fr]"
-              >
-                <div>
-                  <p className="font-medium">{user.full_name}</p>
-                  <p className="mt-2 text-sm text-slate-400">{user.email}</p>
+            {users.map((managedUser) => {
+              const canManageAccount =
+                currentUser?.role === "administrator" || managedUser.role !== "administrator";
+
+              return (
+                <div
+                  key={managedUser.id}
+                  className="grid gap-4 rounded-[24px] border border-white/10 bg-black/15 p-4 md:grid-cols-[1.1fr_0.75fr_0.75fr_0.9fr]"
+                >
+                  <div>
+                    <p className="font-medium">{managedUser.full_name}</p>
+                    <p className="mt-2 text-sm text-slate-400">{managedUser.email}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Role</p>
+                    <span className={cn("mt-3 inline-flex rounded-full px-2.5 py-1 text-xs font-medium", statusTone(managedUser.role))}>
+                      {labelize(managedUser.role)}
+                    </span>
+                  </div>
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.18em] text-slate-500">State</p>
+                    <span
+                      className={cn(
+                        "mt-3 inline-flex rounded-full px-2.5 py-1 text-xs font-medium",
+                        managedUser.is_active ? "bg-emerald-500/15 text-emerald-200" : "bg-slate-500/20 text-slate-200"
+                      )}
+                    >
+                      {managedUser.is_active ? "Active" : "Inactive"}
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-3 md:justify-end">
+                    {canManageUsers && canManageAccount ? (
+                      <>
+                        <Link
+                          href={`/dashboard/users/${managedUser.id}`}
+                          className="inline-flex h-10 items-center justify-center rounded-md border border-border px-4 text-sm font-medium text-slate-200 transition hover:bg-panelSoft"
+                        >
+                          Edit
+                        </Link>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          className="border-red-400/30 text-red-200 hover:bg-red-500/10"
+                          disabled={deleteUserMutation.isPending}
+                          onClick={() => handleDelete(managedUser.id, managedUser.full_name)}
+                        >
+                          <Trash2 size={16} aria-hidden="true" />
+                          Delete
+                        </Button>
+                      </>
+                    ) : null}
+                  </div>
                 </div>
-                <div>
-                  <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Role</p>
-                  <span className={cn("mt-3 inline-flex rounded-full px-2.5 py-1 text-xs font-medium", statusTone(user.role))}>
-                    {labelize(user.role)}
-                  </span>
-                </div>
-                <div>
-                  <p className="text-xs uppercase tracking-[0.18em] text-slate-500">State</p>
-                  <span
-                    className={cn(
-                      "mt-3 inline-flex rounded-full px-2.5 py-1 text-xs font-medium",
-                      user.is_active ? "bg-emerald-500/15 text-emerald-200" : "bg-slate-500/20 text-slate-200"
-                    )}
-                  >
-                    {user.is_active ? "Active" : "Inactive"}
-                  </span>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </SectionCard>

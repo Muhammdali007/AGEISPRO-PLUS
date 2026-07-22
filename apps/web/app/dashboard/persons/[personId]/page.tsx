@@ -2,17 +2,24 @@
 
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, Trash2 } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { Button } from "@/components/button";
 import { EmptyState, SectionCard } from "@/components/dashboard-ui";
-import { fetchProtectedMedia, getPerson, updatePerson, uploadPersonFaceImages } from "@/lib/api";
+import {
+  deletePerson,
+  fetchProtectedMedia,
+  getPerson,
+  updatePerson,
+  uploadPersonFaceImages,
+  validatePersonFaceUpload
+} from "@/lib/api";
 import { useAuthStore } from "@/lib/auth-store";
 import { formatDateTime, statusTone } from "@/lib/format";
 import { cn } from "@/lib/cn";
@@ -32,13 +39,15 @@ type UpdatePersonForm = z.infer<typeof updatePersonSchema>;
 
 export default function PersonDetailPage() {
   const params = useParams<{ personId: string }>();
+  const router = useRouter();
   const queryClient = useQueryClient();
-  const { accessToken, user } = useAuthStore();
+  const { accessToken, user, logout } = useAuthStore();
   const [profileError, setProfileError] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [uploadFiles, setUploadFiles] = useState<File[]>([]);
   const [uploadPrimary, setUploadPrimary] = useState(false);
-  const canEdit = user?.role === "administrator" || user?.role === "supervisor" || user?.role === "operator";
+  const canManage = user?.role === "administrator" || user?.role === "supervisor";
 
   const personQuery = useQuery({
     queryKey: ["persons", "detail", params.personId, accessToken],
@@ -92,6 +101,11 @@ export default function PersonDetailPage() {
       await queryClient.invalidateQueries({ queryKey: ["persons", "list", accessToken] });
     },
     onError: (cause) => {
+      if (cause instanceof Error && (cause.message === "Invalid credentials" || cause.message === "Session expired")) {
+        logout();
+        router.push("/login");
+        return;
+      }
       setProfileError(cause instanceof Error ? cause.message : "Unable to update person");
     }
   });
@@ -113,7 +127,33 @@ export default function PersonDetailPage() {
       await queryClient.invalidateQueries({ queryKey: ["persons", "list", accessToken] });
     },
     onError: (cause) => {
+      if (cause instanceof Error && (cause.message === "Invalid credentials" || cause.message === "Session expired")) {
+        logout();
+        router.push("/login");
+        return;
+      }
       setUploadError(cause instanceof Error ? cause.message : "Unable to upload face images");
+    }
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: async () => {
+      if (!accessToken) {
+        throw new Error("You need to sign in again before deleting a person.");
+      }
+      await deletePerson(accessToken, params.personId);
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["persons", "list", accessToken] });
+      router.push("/dashboard/persons");
+    },
+    onError: (cause) => {
+      if (cause instanceof Error && (cause.message === "Invalid credentials" || cause.message === "Session expired")) {
+        logout();
+        router.push("/login");
+        return;
+      }
+      setDeleteError(cause instanceof Error ? cause.message : "Unable to delete person");
     }
   });
 
@@ -129,7 +169,28 @@ export default function PersonDetailPage() {
       setUploadError("Choose one or more face images first.");
       return;
     }
+    try {
+      validatePersonFaceUpload({
+        files: uploadFiles,
+        is_primary: uploadPrimary
+      });
+    } catch (cause) {
+      setUploadError(cause instanceof Error ? cause.message : "Unable to upload face images");
+      return;
+    }
     await uploadMutation.mutateAsync();
+  }
+
+  async function onDelete() {
+    if (!person) {
+      return;
+    }
+    setDeleteError(null);
+    const confirmed = window.confirm(`Delete ${person.full_name}? This will remove the person profile and enrolled faces.`);
+    if (!confirmed) {
+      return;
+    }
+    await deleteMutation.mutateAsync();
   }
 
   return (
@@ -196,8 +257,8 @@ export default function PersonDetailPage() {
         </SectionCard>
       ) : null}
 
-      {person && canEdit ? (
-        <SectionCard title="Upload face images" description="Attach real photos for this person and let the backend generate stored embeddings from each image.">
+      {person && canManage ? (
+        <SectionCard title="Upload face images" description="Add 3-5 clear single-person views (front, slight left/right, and the real camera angle). Quality checks reject group photos and faces that are too small or unclear.">
           <form className="grid gap-5" onSubmit={onUploadSubmit}>
             <FormField label="Face images">
               <input
@@ -206,8 +267,16 @@ export default function PersonDetailPage() {
                 accept="image/*"
                 multiple
                 onChange={(event) => {
-                  setUploadFiles(Array.from(event.target.files ?? []));
-                  setUploadError(null);
+                  const files = Array.from(event.target.files ?? []);
+                  try {
+                    validatePersonFaceUpload({ files });
+                    setUploadFiles(files);
+                    setUploadError(null);
+                  } catch (cause) {
+                    setUploadFiles([]);
+                    event.target.value = "";
+                    setUploadError(cause instanceof Error ? cause.message : "Unable to select face images");
+                  }
                 }}
               />
             </FormField>
@@ -246,7 +315,7 @@ export default function PersonDetailPage() {
         </SectionCard>
       ) : null}
 
-      {person && canEdit ? (
+      {person && canManage ? (
         <SectionCard title="Update profile" description="Adjust identity metadata or deactivate the profile without losing recognition history.">
           <form className="grid gap-5 lg:grid-cols-2" onSubmit={updateForm.handleSubmit(onProfileSubmit)}>
             <FormField label="Full name" error={updateForm.formState.errors.full_name?.message}>
@@ -315,6 +384,29 @@ export default function PersonDetailPage() {
               </Button>
             </div>
           </form>
+        </SectionCard>
+      ) : null}
+
+      {person && canManage ? (
+        <SectionCard title="Danger zone" description="Delete this person if the profile and enrolled faces should be removed from the registry.">
+          {deleteError ? (
+            <div className="mb-4 rounded-md border border-danger/50 bg-danger/10 px-3 py-2 text-sm text-red-200">
+              {deleteError}
+            </div>
+          ) : null}
+
+          <div className="flex flex-wrap items-center gap-3">
+            <Button
+              type="button"
+              variant="ghost"
+              className="border-red-400/30 text-red-200 hover:bg-red-500/10"
+              onClick={onDelete}
+              disabled={deleteMutation.isPending}
+            >
+              <Trash2 size={16} aria-hidden="true" />
+              {deleteMutation.isPending ? "Deleting person" : "Delete person"}
+            </Button>
+          </div>
         </SectionCard>
       ) : null}
     </div>

@@ -11,7 +11,9 @@ from app.core.config import settings
 from app.db.metadata import Base
 from app.db.session import get_db
 from app.main import app
+from app.models.audit_log import AuditLog
 from app.models.user import User, UserRole
+from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.alerts import AlertRepository
 from app.repositories.cameras import CameraRepository
 from app.repositories.incidents import IncidentRepository
@@ -20,6 +22,7 @@ from app.schemas.alerts import AlertCreate
 from app.schemas.cameras import CameraCreate
 from app.schemas.incidents import IncidentCreate, IncidentUpdate
 from app.schemas.users import UserCreate
+from app.services.audit_logs import AuditLogService
 
 
 @pytest_asyncio.fixture
@@ -260,3 +263,96 @@ async def test_audit_logs_capture_incident_and_alert_workflow_actions(
     filtered = await client.get("/api/v1/monitoring/audit-logs?action=incidents.update")
     assert filtered.status_code == 200
     assert filtered.json()["total"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_audit_log_endpoint_requires_admin_or_supervisor(
+    client: AsyncClient,
+    session: AsyncSession,
+) -> None:
+    operator = await UserRepository(session).create(
+        UserCreate(
+            email="phase8-operator@aegispro.local",
+            full_name="Phase8 Operator",
+            role=UserRole.operator,
+            password="ChangeMe123!",
+        )
+    )
+    await _set_current_user(operator)
+
+    response = await client.get("/api/v1/monitoring/audit-logs")
+
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_audit_log_endpoint_redacts_legacy_sensitive_metadata(
+    client: AsyncClient,
+    session: AsyncSession,
+) -> None:
+    admin = await UserRepository(session).create(
+        UserCreate(
+            email="phase8-redaction@aegispro.local",
+            full_name="Phase8 Redaction",
+            role=UserRole.administrator,
+            password="ChangeMe123!",
+        )
+    )
+    await _set_current_user(admin)
+
+    session.add(
+        AuditLog(
+            actor_user_id=admin.id,
+            actor_email=admin.email,
+            actor_role=admin.role.value,
+            action="users.update",
+            resource_type="user",
+            resource_id=str(admin.id),
+            metadata_={
+                "password": "legacy-plaintext",
+                "profile": {"password_hash": "legacy-hash"},
+                "tokens": [{"access_token": "legacy-token"}],
+            },
+        )
+    )
+    await session.commit()
+
+    response = await client.get("/api/v1/monitoring/audit-logs")
+
+    assert response.status_code == 200
+    metadata = response.json()["items"][0]["metadata"]
+    assert metadata["password"] == "[REDACTED]"
+    assert metadata["profile"]["password_hash"] == "[REDACTED]"
+    assert metadata["tokens"][0]["access_token"] == "[REDACTED]"
+
+
+@pytest.mark.asyncio
+async def test_audit_log_service_redacts_sensitive_metadata_recursively(
+    session: AsyncSession,
+) -> None:
+    admin = await UserRepository(session).create(
+        UserCreate(
+            email="phase8-service-redaction@aegispro.local",
+            full_name="Phase8 Service Redaction",
+            role=UserRole.administrator,
+            password="ChangeMe123!",
+        )
+    )
+
+    await AuditLogService(AuditLogRepository(session)).record(
+        actor=admin,
+        action="users.update",
+        resource_type="user",
+        resource_id=str(admin.id),
+        metadata={
+            "password": "plaintext",
+            "profile": {"password_hash": "hash"},
+            "credentials": [{"refresh_token": "token"}],
+        },
+    )
+
+    items, _ = await AuditLogRepository(session).list(action="users.update")
+
+    assert items[0].metadata_["password"] == "[REDACTED]"
+    assert items[0].metadata_["profile"]["password_hash"] == "[REDACTED]"
+    assert items[0].metadata_["credentials"][0]["refresh_token"] == "[REDACTED]"

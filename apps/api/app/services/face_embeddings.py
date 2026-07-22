@@ -8,7 +8,15 @@ from pathlib import Path
 
 from app.core.config import settings
 
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
+_SERVICE_FILE = Path(__file__).resolve()
+PROJECT_ROOT = next(
+    (
+        parent
+        for parent in _SERVICE_FILE.parents
+        if (parent / "docker-compose.yml").exists() or (parent / "storage").exists()
+    ),
+    _SERVICE_FILE.parents[min(2, len(_SERVICE_FILE.parents) - 1)],
+)
 
 
 class FaceEmbeddingError(RuntimeError):
@@ -58,10 +66,9 @@ class InsightFaceEmbeddingBackend(FaceEmbeddingBackend):
     backend_name = "insightface"
 
     def __init__(self) -> None:
-        if "INSIGHTFACE_HOME" not in os.environ:
-            insightface_home = PROJECT_ROOT / "storage" / "insightface"
-            insightface_home.mkdir(parents=True, exist_ok=True)
-            os.environ["INSIGHTFACE_HOME"] = str(insightface_home)
+        insightface_home = PROJECT_ROOT / "storage" / "insightface"
+        insightface_home.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("INSIGHTFACE_HOME", str(insightface_home))
 
         try:
             import numpy as np
@@ -76,6 +83,8 @@ class InsightFaceEmbeddingBackend(FaceEmbeddingBackend):
         self._image = Image
         self._app = FaceAnalysis(
             name=settings.recognition_insightface_model,
+            root=str(insightface_home),
+            allowed_modules=["detection", "recognition"],
             providers=settings.recognition_insightface_providers,
         )
         self._app.prepare(
@@ -85,7 +94,8 @@ class InsightFaceEmbeddingBackend(FaceEmbeddingBackend):
 
     def extract_embedding(self, image_bytes: bytes) -> FaceEmbeddingResult:
         image = self._image.open(BytesIO(image_bytes)).convert("RGB")
-        image_array = self._np.array(image)
+        # Keep enrollment identical to runtime: InsightFace expects BGR input.
+        image_array = self._np.array(image)[:, :, ::-1]
         faces = self._app.get(image_array)
         if not faces:
             raise FaceEmbeddingError("No detectable face was found in the provided image.")

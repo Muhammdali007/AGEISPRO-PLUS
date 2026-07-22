@@ -8,7 +8,15 @@ from pathlib import Path
 
 from app.core.config import settings
 
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
+_SERVICE_FILE = Path(__file__).resolve()
+PROJECT_ROOT = next(
+    (
+        parent
+        for parent in _SERVICE_FILE.parents
+        if (parent / "docker-compose.yml").exists() or (parent / "storage").exists()
+    ),
+    _SERVICE_FILE.parents[min(2, len(_SERVICE_FILE.parents) - 1)],
+)
 
 
 class FaceEmbeddingError(RuntimeError):
@@ -28,6 +36,10 @@ class FaceEmbeddingBackend:
 
     def extract_embedding(self, image_bytes: bytes) -> FaceEmbeddingResult:
         raise NotImplementedError
+
+    def extract_embeddings(self, image_bytes: bytes) -> list[FaceEmbeddingResult]:
+        """Extract every usable face while decoding/analyzing the image only once."""
+        return [self.extract_embedding(image_bytes)]
 
 
 class HashFaceEmbeddingBackend(FaceEmbeddingBackend):
@@ -58,10 +70,9 @@ class InsightFaceEmbeddingBackend(FaceEmbeddingBackend):
     backend_name = "insightface"
 
     def __init__(self) -> None:
-        if "INSIGHTFACE_HOME" not in os.environ:
-            insightface_home = PROJECT_ROOT / "storage" / "insightface"
-            insightface_home.mkdir(parents=True, exist_ok=True)
-            os.environ["INSIGHTFACE_HOME"] = str(insightface_home)
+        insightface_home = PROJECT_ROOT / "storage" / "insightface"
+        insightface_home.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("INSIGHTFACE_HOME", str(insightface_home))
 
         try:
             import numpy as np
@@ -76,6 +87,8 @@ class InsightFaceEmbeddingBackend(FaceEmbeddingBackend):
         self._image = Image
         self._app = FaceAnalysis(
             name=settings.recognition_insightface_model,
+            root=str(insightface_home),
+            allowed_modules=["detection", "recognition"],
             providers=settings.recognition_insightface_providers,
         )
         self._app.prepare(
@@ -84,38 +97,71 @@ class InsightFaceEmbeddingBackend(FaceEmbeddingBackend):
         )
 
     def extract_embedding(self, image_bytes: bytes) -> FaceEmbeddingResult:
+        results = self.extract_embeddings(image_bytes)
+        if not results:
+            raise FaceEmbeddingError("No detectable face was found in the provided image.")
+        return results[0]
+
+    def extract_embeddings(self, image_bytes: bytes) -> list[FaceEmbeddingResult]:
         image = self._image.open(BytesIO(image_bytes)).convert("RGB")
-        image_array = self._np.array(image)
+        # InsightFace's FaceAnalysis uses OpenCV conventions and expects BGR.
+        image_array = self._np.array(image)[:, :, ::-1]
         faces = self._app.get(image_array)
         if not faces:
             raise FaceEmbeddingError("No detectable face was found in the provided image.")
 
-        face = max(
+        ranked_faces = sorted(
             faces,
-            key=lambda candidate: float(
-                getattr(candidate, "det_score", 0.0)
+            key=lambda candidate: (
+                float(getattr(candidate, "det_score", 0.0)),
+                self._face_area(getattr(candidate, "bbox", None)),
             ),
+            reverse=True,
         )
-        embedding = getattr(face, "normed_embedding", None)
-        if embedding is None:
-            embedding = getattr(face, "embedding", None)
-        if embedding is None:
-            raise FaceEmbeddingError("InsightFace did not return an embedding for the detected face.")
+        results: list[FaceEmbeddingResult] = []
+        for face_index, face in enumerate(ranked_faces):
+            embedding = getattr(face, "normed_embedding", None)
+            if embedding is None:
+                embedding = getattr(face, "embedding", None)
+            if embedding is None:
+                continue
 
-        vector = [round(float(value), 6) for value in embedding.tolist()]
-        bbox = getattr(face, "bbox", None)
-        return FaceEmbeddingResult(
-            vector=vector,
-            model_name=f"insightface-{settings.recognition_insightface_model}",
-            backend_name=self.backend_name,
-            metadata={
-                "backend": self.backend_name,
-                "deterministic": False,
-                "dimensions": len(vector),
-                "det_score": round(float(getattr(face, "det_score", 0.0)), 4),
-                "face_count": len(faces),
-                "bbox": [round(float(value), 2) for value in bbox.tolist()] if bbox is not None else None,
-            },
+            vector = [round(float(value), 6) for value in embedding.tolist()]
+            bbox = getattr(face, "bbox", None)
+            results.append(
+                FaceEmbeddingResult(
+                    vector=vector,
+                    model_name=f"insightface-{settings.recognition_insightface_model}",
+                    backend_name=self.backend_name,
+                    metadata={
+                        "backend": self.backend_name,
+                        "deterministic": False,
+                        "dimensions": len(vector),
+                        "det_score": round(float(getattr(face, "det_score", 0.0)), 4),
+                        "face_count": len(faces),
+                        "face_index": face_index,
+                        "bbox": (
+                            [round(float(value), 2) for value in bbox.tolist()]
+                            if bbox is not None
+                            else None
+                        ),
+                    },
+                )
+            )
+
+        if not results:
+            raise FaceEmbeddingError("InsightFace did not return an embedding for any detected face.")
+        return results
+
+    @staticmethod
+    def _face_area(bbox: object) -> float:
+        if bbox is None or not hasattr(bbox, "tolist"):
+            return 0.0
+        values = bbox.tolist()
+        if not isinstance(values, list) or len(values) != 4:
+            return 0.0
+        return max(0.0, float(values[2]) - float(values[0])) * max(
+            0.0, float(values[3]) - float(values[1])
         )
 
 

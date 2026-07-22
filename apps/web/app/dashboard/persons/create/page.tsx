@@ -11,7 +11,11 @@ import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { Button } from "@/components/button";
 import { EmptyState, SectionCard } from "@/components/dashboard-ui";
-import { createPerson, uploadPersonFaceImages } from "@/lib/api";
+import {
+  createPerson,
+  uploadPersonFaceImages,
+  validatePersonFaceUpload
+} from "@/lib/api";
 import { useAuthStore } from "@/lib/auth-store";
 
 const personTypes = ["employee", "student", "visitor", "contractor", "other"] as const;
@@ -34,7 +38,7 @@ export default function CreatePersonPage() {
   const [error, setError] = useState<string | null>(null);
   const [uploadFiles, setUploadFiles] = useState<File[]>([]);
   const [uploadPrimary, setUploadPrimary] = useState(true);
-  const handleFileChange = handleFileChangeFactory(setUploadFiles);
+  const handleFileChange = handleFileChangeFactory(setUploadFiles, setError);
   const form = useForm<CreatePersonForm>({
     resolver: zodResolver(createPersonSchema),
     defaultValues: {
@@ -51,6 +55,12 @@ export default function CreatePersonPage() {
     mutationFn: async (values: CreatePersonForm) => {
       if (!accessToken) {
         throw new Error("You need to sign in again before creating a person.");
+      }
+      if (uploadFiles.length > 0) {
+        validatePersonFaceUpload({
+          files: uploadFiles,
+          is_primary: uploadPrimary
+        });
       }
       const person = await createPerson(accessToken, {
         full_name: values.full_name,
@@ -88,16 +98,16 @@ export default function CreatePersonPage() {
     createPersonMutation.mutate(values);
   }
 
-  if (user?.role && user.role !== "administrator" && user.role !== "supervisor" && user.role !== "operator") {
+  if (user?.role && user.role !== "administrator" && user.role !== "supervisor") {
     return (
       <SectionCard
         title="Create known person"
-        description="Only administrators, supervisors, and operators can add known-person profiles."
+        description="Only administrators and supervisors can add known-person profiles."
         action={<BackLink />}
       >
         <EmptyState
           title="Elevated access required"
-          description="Your current account can view known persons, but only operators, supervisors, and administrators can add or modify them."
+          description="Your current account can view known persons, but only administrators and supervisors can add or modify them."
         />
       </SectionCard>
     );
@@ -167,7 +177,7 @@ export default function CreatePersonPage() {
               onChange={handleFileChange}
             />
             <span className="mt-2 block text-sm text-slate-400">
-              Optional. If you attach photos here, the app will create the profile and immediately extract embeddings from each uploaded image.
+              For reliable matching, upload 3-5 sharp single-person photos: front, slight left, slight right, and one from the actual camera angle. Avoid group photos, filters, sunglasses, and heavy backlighting.
             </span>
           </FormField>
 
@@ -219,9 +229,18 @@ export default function CreatePersonPage() {
   );
 }
 
-function handleFileChangeFactory(setUploadFiles: (files: File[]) => void) {
+function handleFileChangeFactory(setUploadFiles: (files: File[]) => void, setError: (message: string | null) => void) {
   return (event: ChangeEvent<HTMLInputElement>) => {
-    setUploadFiles(Array.from(event.target.files ?? []));
+    const files = Array.from(event.target.files ?? []);
+    try {
+      validatePersonFaceUpload({ files });
+      setUploadFiles(files);
+      setError(null);
+    } catch (cause) {
+      setUploadFiles([]);
+      event.target.value = "";
+      setError(cause instanceof Error ? cause.message : "Unable to select face images");
+    }
   };
 }
 

@@ -26,6 +26,21 @@ export function labelize(value: string) {
   return value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+export function detectionDisplayLabel(
+  detectionType: string,
+  boundingBoxes?: Array<Record<string, unknown>>
+) {
+  if (detectionType === "weapon") {
+    const weaponLabel = boundingBoxes
+      ?.map((box) => box.label)
+      .find((label): label is string => typeof label === "string" && label !== "weapon" && label !== "face");
+    if (weaponLabel) {
+      return labelize(weaponLabel);
+    }
+  }
+  return labelize(detectionType);
+}
+
 export function statusTone(
   value: CameraStatus | IncidentPriority | IncidentStatus | AlertStatus | UserRole | "ok" | string
 ) {

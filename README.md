@@ -143,7 +143,7 @@ Run the AI service:
 cd apps/ai
 python -m venv .venv
 .venv/Scripts/activate
-pip install -e .
+pip install -e ".[model,recognition]"
 uvicorn app.main:app --reload --port 8100
 ```
 
@@ -156,7 +156,15 @@ pip install -e ".[model]"
 
 Then set `AI_MODEL_BACKEND=ultralytics` and point `AI_MODEL_WEIGHTS_PATH` at a
 YOLO11-compatible checkpoint. ByteTrack is enabled through
-`AI_MODEL_TRACKER_CONFIG=bytetrack.yaml`.
+`AI_MODEL_TRACKER_CONFIG=bytetrack.yaml`. The production-oriented path now
+preinstalls tracker dependencies, disables Ultralytics runtime autoinstall with
+`AI_MODEL_RUNTIME_AUTOINSTALL=false`, preloads checkpoints on startup, and uses
+`/v1/inference/run-batch` for continuous multi-camera inference.
+
+On a Windows machine with an Intel GPU, export the trained checkpoints to OpenVINO and set
+`AI_MODEL_DEVICE=intel:gpu`. The backend checks the requested device at startup and safely falls
+back when it is unavailable. See [detection runtime](docs/detection-runtime.md) for the measured
+local benchmark and role-specific paths.
 
 To enable production-style face recognition embeddings instead of the
 development-safe hash fallback:
@@ -176,22 +184,34 @@ AI_RECOGNITION_BACKEND=insightface
 API_RECOGNITION_BACKEND=insightface
 AI_RECOGNITION_ALLOW_FALLBACK=false
 API_RECOGNITION_ALLOW_FALLBACK=false
+AI_RECOGNITION_INSIGHTFACE_MODEL=buffalo_m
+API_RECOGNITION_INSIGHTFACE_MODEL=buffalo_m
 ```
+
+Enroll 3-5 clear, single-person views per identity (front plus useful camera angles). Enrollment
+rejects low-quality, very small, or group photos, and runtime matching removes duplicate templates.
+`AI_RECOGNITION_MIN_FACE_DETECTION_SCORE` and `AI_RECOGNITION_MIN_FACE_SIZE` prevent weak live face
+crops from being promoted to known identities. Weapon overlays and incidents preserve canonical
+subtypes (`Knife`, `Scissors`, `Pistol`, `Shotgun`, and so on) and use `Other weapon` when the active
+checkpoint only provides a generic weapon class.
 
 ## Production deployment
 
-The repo now includes a root [`.env.production`](C:/Users/Hp/Desktop/AegisPro/.env.production) for the Docker stack and a
-template at [`.env.production.example`](C:/Users/Hp/Desktop/AegisPro/.env.production.example).
+The repo now includes a root `.env.production` for the Docker stack and a template at
+`.env.production.example`.
 
 - `docker-compose.yml` now starts `postgres`, `redis`, `api`, `ai`, `web`, and `nginx`.
 - The API container runs `alembic upgrade head` before serving traffic.
 - Nginx proxies `/backend/*` directly to the API so browser calls and websocket events work behind one origin.
-- Production mode now fails fast if simulated inference, hash recognition, fallback backends, default secrets, or a missing weapon checkpoint are configured.
+- Production mode now fails fast if simulated inference, hash recognition, fallback backends, default secrets, missing checkpoints, or unsigned weapon/fire-smoke promotions are configured.
+- The continuous detection worker now uses bounded per-camera queues plus batched AI requests. Size those with `API_CONTINUOUS_DETECTION_BATCH_SIZE` and `API_CONTINUOUS_DETECTION_MAX_PENDING_PER_CAMERA`.
+- AI runtime health now surfaces preload/batch mode plus the `load`, `soak_8h`, `soak_24h`, and `soak_72h` gate report configured by `AI_RUNTIME_GATE_REPORT_PATH`.
 
 Important:
-- Real knife or weapon detection requires a trained checkpoint at `AI_MODEL_WEAPON_WEIGHTS_PATH`.
-- The current repository contains `storage/models/yolo11n.pt`, but that is not a dedicated weapon model.
-- Until you place a real weapon checkpoint at the configured path, the production AI service will refuse to start.
+- The platform deployment stack is production-hardened, but the local detector checkpoints in this repo are not production-promoted by default.
+- Real knife or weapon detection now requires a trained checkpoint at `AI_MODEL_WEAPON_WEIGHTS_PATH` and a signed promotion manifest tied to its hash.
+- Real fire/smoke detection now requires the same signed-promotion evidence for `AI_MODEL_FIRE_SMOKE_WEIGHTS_PATH`.
+- The current repository contains local model artifacts for staged evaluation, not signed production detector releases.
 
 The default `CPUExecutionProvider` works for local CPU inference. In production,
 you can swap the ONNX Runtime provider list and model settings to match your GPU
@@ -210,6 +230,18 @@ Default development credentials:
 ```text
 Email: admin@aegispro.local
 Password: ChangeMe123!
+```
+
+Active administrators can use the login page's password reset flow when
+SendGrid is configured. Set `SENDGRID_API_KEY`, `PASSWORD_RESET_FROM_EMAIL`,
+and `WEB_APP_URL` in production so reset links can be delivered.
+
+If email recovery is unavailable or all administrator accounts are locked out,
+use the offline recovery command from the API environment:
+
+```bash
+cd apps/api
+python -m app.management.reset_admin_password --email admin@aegispro.local
 ```
 
 `STORAGE_ROOT` is resolved relative to the repo root, so `storage` points at
@@ -248,6 +280,11 @@ Phase 10 is now the implemented boundary. The platform ships with:
   indexing for production-readiness work.
 - A hardened production ingress, private service network, operational
   monitoring, bounded logs, and a documented backup/restore strategy.
+
+The production deployment baseline now assumes model governance is separate from infrastructure
+hardening. See [`docs/detection-runtime.md`](docs/detection-runtime.md) and
+[`docs/model-promotion.md`](docs/model-promotion.md) for the current detection limits and the
+signed promotion workflow.
 
 Documentation for earlier phases remains useful for architecture context, but
 Phase 10 is the current end-to-end production deployment baseline. See

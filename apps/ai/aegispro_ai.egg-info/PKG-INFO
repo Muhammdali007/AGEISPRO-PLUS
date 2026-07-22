@@ -8,11 +8,15 @@ Requires-Dist: pillow>=10.4.0
 Requires-Dist: pydantic-settings>=2.4.0
 Requires-Dist: uvicorn[standard]>=0.30.6
 Provides-Extra: model
+Requires-Dist: lapx>=0.5.2; extra == "model"
+Requires-Dist: openvino>=2025.3.0; extra == "model"
+Requires-Dist: pyyaml>=6.0; extra == "model"
 Requires-Dist: ultralytics>=8.3.0; extra == "model"
 Provides-Extra: recognition
 Requires-Dist: insightface>=0.7.3; extra == "recognition"
 Requires-Dist: numpy>=1.26.4; extra == "recognition"
 Requires-Dist: onnxruntime>=1.18.1; extra == "recognition"
 Provides-Extra: dev
+Requires-Dist: numpy>=1.26.4; extra == "dev"
 Requires-Dist: pytest>=8.3.2; extra == "dev"
 Requires-Dist: ruff>=0.6.2; extra == "dev"

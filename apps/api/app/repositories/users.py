@@ -1,10 +1,10 @@
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import hash_password
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.schemas.users import UserCreate, UserSelfUpdate, UserUpdate
 
 
@@ -22,6 +22,16 @@ class UserRepository:
         result = await self.session.scalars(select(User).order_by(User.created_at.desc()))
         return list(result)
 
+    async def count_active_administrators(self) -> int:
+        return (
+            await self.session.scalar(
+                select(func.count())
+                .select_from(User)
+                .where(User.role == UserRole.administrator, User.is_active.is_(True))
+            )
+            or 0
+        )
+
     async def create(self, payload: UserCreate) -> User:
         user = User(
             email=payload.email.lower(),
@@ -31,7 +41,7 @@ class UserRepository:
             is_active=payload.is_active,
         )
         self.session.add(user)
-        await self.session.commit()
+        await self.session.flush()
         await self.session.refresh(user)
         return user
 
@@ -44,6 +54,10 @@ class UserRepository:
             setattr(user, key, value)
         if password:
             user.password_hash = hash_password(password)
-        await self.session.commit()
+        await self.session.flush()
         await self.session.refresh(user)
         return user
+
+    async def delete(self, user: User) -> None:
+        await self.session.delete(user)
+        await self.session.flush()

@@ -4,8 +4,15 @@ const adminEmail = "admin@aegispro.local";
 const adminPassword = "ChangeMe123!";
 const accessToken = "playwright-access-token";
 const refreshToken = "playwright-refresh-token";
+const tinyPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+let liveScanRequestCount = 0;
+let liveScanRequestedDetectors: string[] = [];
+let browserCameraMode = false;
 
 test.beforeEach(async ({ page }) => {
+  liveScanRequestCount = 0;
+  liveScanRequestedDetectors = [];
+  browserCameraMode = false;
   await stubBackend(page);
   await clearBrowserState(page);
 });
@@ -16,6 +23,27 @@ test("redirects anonymous dashboard visitors to login", async ({ page }) => {
   await expect(page).toHaveURL(/\/login$/);
   await expect(page.getByRole("heading", { name: "AegisPro" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Forgot password?" })).toBeVisible();
+});
+
+test("allows an administrator to request and complete password reset", async ({ page }) => {
+  await page.goto("/login");
+  await page.getByRole("link", { name: "Forgot password?" }).click();
+
+  await expect(page).toHaveURL(/\/forgot-password$/);
+  await page.getByLabel("Administrator email").fill(adminEmail);
+  await page.getByRole("button", { name: "Send reset link" }).click();
+  await expect(page.getByText("If an active administrator account matches that email")).toBeVisible();
+
+  await page.goto("/reset-password?token=playwright-reset-token");
+  await page.getByLabel("New password", { exact: true }).fill("NewPassword123!");
+  await page.getByLabel("Confirm new password").fill("DifferentPassword123!");
+  await page.getByRole("button", { name: "Reset password" }).click();
+  await expect(page.getByText("Passwords do not match.")).toBeVisible();
+
+  await page.getByLabel("Confirm new password").fill("NewPassword123!");
+  await page.getByRole("button", { name: "Reset password" }).click();
+  await expect(page.getByText("Password reset complete. You can now sign in.")).toBeVisible();
 });
 
 test("allows an administrator to sign in and navigate the main dashboard routes", async ({ page }) => {
@@ -23,6 +51,10 @@ test("allows an administrator to sign in and navigate the main dashboard routes"
 
   await expect(page.getByRole("heading", { name: "Live operations workspace" })).toBeVisible();
   await expect(page.getByText("Phase 9 optimization", { exact: true })).toBeVisible();
+  const soundAlerts = page.getByRole("button", { name: "Enable sound alerts" });
+  await expect(soundAlerts).toBeVisible();
+  await soundAlerts.click();
+  await expect(page.getByRole("button", { name: "Sound alerts on" })).toBeVisible();
 
   await page.getByRole("link", { name: /Cameras/i }).click();
   await expect(page).toHaveURL(/\/dashboard\/cameras$/);
@@ -54,6 +86,48 @@ test("loads the phase 9 analytics dashboard with optimization telemetry", async 
   await expect(page.getByRole("heading", { name: "Optimization report" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Recent audit log" })).toBeVisible();
   await expect(page.getByText("alerts.clear")).toBeVisible();
+});
+
+test("uses server overlays without duplicating inference for server-readable cameras", async ({ page }) => {
+  await loginViaUi(page);
+  await page.goto("/dashboard/cameras/camera-1");
+
+  await expect(page.getByText("Weapon", { exact: true })).toBeVisible();
+  await expect(page.getByText("Backend worker owns inference; this page consumes its latest overlay data.")).toBeVisible();
+  await page.waitForTimeout(2_500);
+  expect(liveScanRequestCount).toBe(0);
+});
+
+test("transports browser-camera frames and bridges one missed person scan", async ({ page }) => {
+  browserCameraMode = true;
+  await page.addInitScript(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 640;
+    canvas.height = 480;
+    const context = canvas.getContext("2d");
+    context?.fillRect(0, 0, canvas.width, canvas.height);
+    window.setInterval(() => {
+      if (context) {
+        context.fillStyle = context.fillStyle === "#000000" ? "#010101" : "#000000";
+        context.fillRect(0, 0, canvas.width, canvas.height);
+      }
+    }, 100);
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: async () => canvas.captureStream(5)
+      }
+    });
+  });
+  await loginViaUi(page);
+  await page.goto("/dashboard/cameras/camera-1");
+
+  await expect.poll(() => liveScanRequestCount, { timeout: 8_000 }).toBeGreaterThanOrEqual(2);
+  await page.waitForTimeout(100);
+
+  expect(liveScanRequestedDetectors).toEqual(["person", "weapon", "fire", "smoke"]);
+  await expect(page.getByText("Person", { exact: true })).toBeVisible();
+  await expect(page.getByText("Weapon", { exact: true })).toHaveCount(0);
 });
 
 async function clearBrowserState(page: Page) {
@@ -107,6 +181,20 @@ async function stubBackend(page: Page) {
       return;
     }
 
+    if (path === "/api/v1/auth/forgot-password" && method === "POST") {
+      await fulfillJson(route, {
+        detail: "If an active administrator account matches that email, password reset instructions have been sent."
+      });
+      return;
+    }
+
+    if (path === "/api/v1/auth/reset-password" && method === "POST") {
+      await fulfillJson(route, {
+        detail: "Password reset complete. You can now sign in."
+      });
+      return;
+    }
+
     if (path === "/api/v1/cameras") {
       await fulfillJson(route, [
         {
@@ -127,6 +215,111 @@ async function stubBackend(page: Page) {
           updated_at: "2026-07-07T12:00:00Z"
         }
       ]);
+      return;
+    }
+
+    if (path === "/api/v1/cameras/camera-1") {
+      await fulfillJson(route, {
+        id: "camera-1",
+        name: "North Gate",
+        source_type: browserCameraMode ? "usb" : "http",
+        source: browserCameraMode ? "browser-camera" : `data:image/png;base64,${tinyPng}`,
+        status: "online",
+        location: "North Gate",
+        group: "perimeter",
+        tags: ["perimeter"],
+        detection_enabled: true,
+        inference_fps: 1,
+        metadata: {},
+        last_seen_at: "2026-07-07T12:00:00Z",
+        health_checked_at: "2026-07-07T12:00:00Z",
+        created_at: "2026-07-07T11:00:00Z",
+        updated_at: "2026-07-07T12:00:00Z"
+      });
+      return;
+    }
+
+    if (path === "/api/v1/cameras/camera-1/stream") {
+      await fulfillJson(route, {
+        camera_id: "camera-1",
+        stream_kind: browserCameraMode ? "browser-camera" : "image",
+        stream_url: browserCameraMode ? null : `data:image/png;base64,${tinyPng}`,
+        browser_supported: true,
+        requires_relay: false,
+        is_live: true,
+        health_status: "online",
+        health_message: browserCameraMode ? "Browser camera ready." : "Image feed available.",
+        checked_at: "2026-07-07T12:00:00Z",
+        controls: [],
+        notes: [],
+        browser_device_id: browserCameraMode ? "playwright-camera" : null
+      });
+      return;
+    }
+
+    if (path === "/api/v1/cameras/camera-1/overlays") {
+      await fulfillJson(route, {
+        camera_id: "camera-1",
+        generated_at: "2026-07-07T12:00:00Z",
+        overlays: [
+          {
+            incident_id: "old-incident",
+            occurred_at: "2026-07-07T11:59:30Z",
+            detection_type: "weapon",
+            confidence: 0.91,
+            track_id: null,
+            recognition_status: null,
+            identity_label: null,
+            bounding_box: { x1: 0, y1: 0, x2: 1, y2: 1, label: "weapon" },
+            face_bounding_box: null,
+            metadata: {}
+          }
+        ]
+      });
+      return;
+    }
+
+    if (path === "/api/v1/cameras/camera-1/live-scan" && method === "POST") {
+      liveScanRequestCount += 1;
+      const requestPayload = route.request().postDataJSON() as { requested_detectors?: string[] };
+      liveScanRequestedDetectors = requestPayload.requested_detectors ?? [];
+      const detections = liveScanRequestCount === 2
+        ? []
+        : [
+            {
+              detection_type: "person",
+              confidence: 0.96,
+              track_id: `person-${liveScanRequestCount}`,
+              recognition_status: null,
+              identity_label: null,
+              bounding_box: { x1: 0, y1: 0, x2: 1, y2: 1, label: "person" },
+              face_bounding_box: null,
+              metadata: {}
+            },
+            {
+              detection_type: "weapon",
+              confidence: 0.91,
+              track_id: `weapon-${liveScanRequestCount}`,
+              recognition_status: null,
+              identity_label: null,
+              bounding_box: { x1: 0, y1: 0, x2: 1, y2: 1, label: "weapon" },
+              face_bounding_box: null,
+              metadata: {}
+            }
+          ];
+      await fulfillJson(route, {
+        camera_id: "camera-1",
+        model_name: "test-detector",
+        model_version: "1",
+        detection_count: detections.length,
+        incident_count: 0,
+        alert_count: 0,
+        ignored_count: 0,
+        detections,
+        ignored_reasons: [],
+        backend: "ultralytics",
+        callback_delivered: false
+      });
       return;
     }
 

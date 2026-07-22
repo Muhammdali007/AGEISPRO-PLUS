@@ -20,10 +20,11 @@ import { formatDateTime, formatPercent, labelize, statusTone } from "@/lib/forma
 const windows: MonitoringWindow[] = ["24h", "7d", "30d"];
 
 export default function AnalyticsPage() {
-  const { accessToken } = useAuthStore();
+  const { accessToken, user } = useAuthStore();
   const [window, setWindow] = useState<MonitoringWindow>("24h");
   const [actionFilter, setActionFilter] = useState("");
   const [resourceTypeFilter, setResourceTypeFilter] = useState("");
+  const canViewAuditLogs = user?.role === "administrator" || user?.role === "supervisor";
 
   const overviewQuery = useQuery({
     queryKey: ["monitoring", "overview", accessToken, window],
@@ -53,7 +54,7 @@ export default function AnalyticsPage() {
         resource_type: resourceTypeFilter || undefined,
         limit: "12"
       }),
-    enabled: Boolean(accessToken)
+    enabled: Boolean(accessToken && canViewAuditLogs)
   });
 
   const overview = overviewQuery.data;
@@ -76,7 +77,7 @@ export default function AnalyticsPage() {
     cameraHealthQuery.error instanceof Error ||
     systemHealthQuery.error instanceof Error ||
     optimizationQuery.error instanceof Error ||
-    auditLogsQuery.error instanceof Error
+    (canViewAuditLogs && auditLogsQuery.error instanceof Error)
   ) {
     return (
       <EmptyState
@@ -90,7 +91,7 @@ export default function AnalyticsPage() {
                 ? systemHealthQuery.error.message
                 : optimizationQuery.error instanceof Error
                   ? optimizationQuery.error.message
-                : auditLogsQuery.error instanceof Error
+                : canViewAuditLogs && auditLogsQuery.error instanceof Error
                   ? auditLogsQuery.error.message
                   : "Unable to load monitoring data."
         }
@@ -98,7 +99,7 @@ export default function AnalyticsPage() {
     );
   }
 
-  if (!overview || !cameraHealth || !systemHealth || !optimization || !auditPage) {
+  if (!overview || !cameraHealth || !systemHealth || !optimization || (canViewAuditLogs && !auditPage)) {
     return (
       <EmptyState
         title="Preparing optimization telemetry"
@@ -338,66 +339,75 @@ export default function AnalyticsPage() {
         title="Recent audit log"
         description="Operator and administrator actions persisted for operational review."
       >
-        <div className="mb-4 grid gap-3 md:grid-cols-3">
-          <label className="block">
-            <span className="mb-2 block text-xs uppercase tracking-[0.18em] text-slate-500">Action</span>
-            <input
-              className="h-11 w-full rounded-md border border-white/10 bg-black/20 px-3 text-sm outline-none transition focus:border-accent"
-              value={actionFilter}
-              onChange={(event) => setActionFilter(event.target.value)}
-              placeholder="alerts.clear"
-            />
-          </label>
-          <label className="block">
-            <span className="mb-2 block text-xs uppercase tracking-[0.18em] text-slate-500">Resource</span>
-            <input
-              className="h-11 w-full rounded-md border border-white/10 bg-black/20 px-3 text-sm outline-none transition focus:border-accent"
-              value={resourceTypeFilter}
-              onChange={(event) => setResourceTypeFilter(event.target.value)}
-              placeholder="camera"
-            />
-          </label>
-          <div className="rounded-[20px] border border-white/10 bg-black/15 px-4 py-3 text-sm text-slate-300">
-            <div className="flex items-center gap-2">
-              <HardDriveDownload size={16} aria-hidden="true" className="text-accent" />
-              {auditPage.total} audit events matched
-            </div>
-            <p className="mt-2 text-slate-400">Filters update the persisted log feed without exporting data outside the platform.</p>
-          </div>
-        </div>
-
-        {auditPage.items.length === 0 ? (
+        {!canViewAuditLogs ? (
           <EmptyState
-            title="No audit events matched"
-            description="Try a broader filter or generate a new workflow action to populate the audit trail."
+            title="Audit log access restricted"
+            description="Only administrators and supervisors can review persisted audit activity."
           />
         ) : (
-          <div className="space-y-3">
-            {auditPage.items.map((entry) => (
-              <div key={entry.id} className="rounded-[20px] border border-white/10 bg-black/15 px-4 py-4">
-                <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-                  <div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className={cn("rounded-full px-2.5 py-1 text-xs font-medium", statusTone(entry.actor_role ?? "viewer"))}>
-                        {labelize(entry.actor_role ?? "system")}
-                      </span>
-                      <span className="rounded-full bg-black/20 px-2.5 py-1 text-xs font-medium text-slate-200 ring-1 ring-white/10">
-                        {entry.action}
-                      </span>
-                      <span className="rounded-full bg-black/20 px-2.5 py-1 text-xs font-medium text-slate-200 ring-1 ring-white/10">
-                        {labelize(entry.resource_type)}
-                      </span>
-                    </div>
-                    <p className="mt-2 text-sm text-slate-300">{entry.actor_email ?? "System action"}</p>
-                  </div>
-                  <div className="text-sm text-slate-400">{formatDateTime(entry.created_at)}</div>
+          <>
+            <div className="mb-4 grid gap-3 md:grid-cols-3">
+              <label className="block">
+                <span className="mb-2 block text-xs uppercase tracking-[0.18em] text-slate-500">Action</span>
+                <input
+                  className="h-11 w-full rounded-md border border-white/10 bg-black/20 px-3 text-sm outline-none transition focus:border-accent"
+                  value={actionFilter}
+                  onChange={(event) => setActionFilter(event.target.value)}
+                  placeholder="alerts.clear"
+                />
+              </label>
+              <label className="block">
+                <span className="mb-2 block text-xs uppercase tracking-[0.18em] text-slate-500">Resource</span>
+                <input
+                  className="h-11 w-full rounded-md border border-white/10 bg-black/20 px-3 text-sm outline-none transition focus:border-accent"
+                  value={resourceTypeFilter}
+                  onChange={(event) => setResourceTypeFilter(event.target.value)}
+                  placeholder="camera"
+                />
+              </label>
+              <div className="rounded-[20px] border border-white/10 bg-black/15 px-4 py-3 text-sm text-slate-300">
+                <div className="flex items-center gap-2">
+                  <HardDriveDownload size={16} aria-hidden="true" className="text-accent" />
+                  {auditPage?.total ?? 0} audit events matched
                 </div>
-                {entry.resource_id ? (
-                  <p className="mt-3 text-sm text-slate-400">Resource ID: {entry.resource_id}</p>
-                ) : null}
+                <p className="mt-2 text-slate-400">Filters update the persisted log feed without exporting data outside the platform.</p>
               </div>
-            ))}
-          </div>
+            </div>
+
+            {auditPage && auditPage.items.length === 0 ? (
+              <EmptyState
+                title="No audit events matched"
+                description="Try a broader filter or generate a new workflow action to populate the audit trail."
+              />
+            ) : (
+              <div className="space-y-3">
+                {auditPage?.items.map((entry) => (
+                  <div key={entry.id} className="rounded-[20px] border border-white/10 bg-black/15 px-4 py-4">
+                    <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                      <div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className={cn("rounded-full px-2.5 py-1 text-xs font-medium", statusTone(entry.actor_role ?? "viewer"))}>
+                            {labelize(entry.actor_role ?? "system")}
+                          </span>
+                          <span className="rounded-full bg-black/20 px-2.5 py-1 text-xs font-medium text-slate-200 ring-1 ring-white/10">
+                            {entry.action}
+                          </span>
+                          <span className="rounded-full bg-black/20 px-2.5 py-1 text-xs font-medium text-slate-200 ring-1 ring-white/10">
+                            {labelize(entry.resource_type)}
+                          </span>
+                        </div>
+                        <p className="mt-2 text-sm text-slate-300">{entry.actor_email ?? "System action"}</p>
+                      </div>
+                      <div className="text-sm text-slate-400">{formatDateTime(entry.created_at)}</div>
+                    </div>
+                    {entry.resource_id ? (
+                      <p className="mt-3 text-sm text-slate-400">Resource ID: {entry.resource_id}</p>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
         )}
       </SectionCard>
     </div>

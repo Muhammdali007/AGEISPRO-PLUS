@@ -8,7 +8,7 @@ Requires-Dist: asyncpg>=0.29.0
 Requires-Dist: email-validator>=2.2.0
 Requires-Dist: fastapi>=0.115.0
 Requires-Dist: gunicorn>=22.0.0
-Requires-Dist: bcrypt<5.0.0,>=4.1.0
+Requires-Dist: bcrypt<4.1.0,>=4.0.1
 Requires-Dist: passlib[bcrypt]>=1.7.4
 Requires-Dist: psycopg[binary]>=3.2.1
 Requires-Dist: pydantic-settings>=2.4.0
@@ -21,6 +21,7 @@ Provides-Extra: recognition
 Requires-Dist: insightface>=0.7.3; extra == "recognition"
 Requires-Dist: numpy>=1.26.4; extra == "recognition"
 Requires-Dist: onnxruntime>=1.18.1; extra == "recognition"
+Requires-Dist: opencv-python-headless>=4.10.0; extra == "recognition"
 Requires-Dist: pillow>=10.4.0; extra == "recognition"
 Provides-Extra: dev
 Requires-Dist: aiosqlite>=0.20.0; extra == "dev"

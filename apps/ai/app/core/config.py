@@ -5,7 +5,17 @@ from typing import Annotated
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
+from app.core.model_promotion import validate_promotion_manifest
+
+_CONFIG_FILE = Path(__file__).resolve()
+PROJECT_ROOT = next(
+    (
+        parent
+        for parent in _CONFIG_FILE.parents
+        if (parent / "docker-compose.yml").exists() or (parent / "storage").exists()
+    ),
+    _CONFIG_FILE.parents[min(2, len(_CONFIG_FILE.parents) - 1)],
+)
 
 
 class Settings(BaseSettings):
@@ -28,22 +38,107 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("AI_MODEL_WEAPON_WEIGHTS_PATH"),
     )
+    model_weapon_ensemble_general: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("AI_MODEL_WEAPON_ENSEMBLE_GENERAL"),
+    )
+    model_weapon_excluded_labels: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("AI_MODEL_WEAPON_EXCLUDED_LABELS"),
+    )
+    model_weapon_max_frame_coverage: float = Field(
+        default=0.60,
+        ge=0.05,
+        le=1.0,
+        validation_alias=AliasChoices("AI_MODEL_WEAPON_MAX_FRAME_COVERAGE"),
+    )
     model_fire_smoke_weights_path: str | None = Field(
         default=None,
         validation_alias=AliasChoices("AI_MODEL_FIRE_SMOKE_WEIGHTS_PATH"),
     )
+    model_fire_weights_path: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_MODEL_FIRE_WEIGHTS_PATH"),
+    )
+    model_smoke_weights_path: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_MODEL_SMOKE_WEIGHTS_PATH"),
+    )
+    model_weapon_promotion_path: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_MODEL_WEAPON_PROMOTION_PATH"),
+    )
+    model_fire_smoke_promotion_path: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_MODEL_FIRE_SMOKE_PROMOTION_PATH"),
+    )
+    model_fire_promotion_path: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_MODEL_FIRE_PROMOTION_PATH"),
+    )
+    model_smoke_promotion_path: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_MODEL_SMOKE_PROMOTION_PATH"),
+    )
     model_device: str | None = Field(default=None, validation_alias=AliasChoices("AI_MODEL_DEVICE"))
     model_image_size: int = Field(default=640, ge=64, validation_alias=AliasChoices("AI_MODEL_IMAGE_SIZE"))
     model_half_precision: bool = Field(default=False, validation_alias=AliasChoices("AI_MODEL_HALF_PRECISION"))
+    model_batch_size: int = Field(default=8, ge=1, le=64, validation_alias=AliasChoices("AI_MODEL_BATCH_SIZE"))
+    model_iou_threshold: float = Field(
+        default=0.60,
+        ge=0.1,
+        le=0.95,
+        validation_alias=AliasChoices("AI_MODEL_IOU_THRESHOLD"),
+    )
+    model_max_detections: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        validation_alias=AliasChoices("AI_MODEL_MAX_DETECTIONS"),
+    )
     model_tracker_config: str = Field(
         default="bytetrack.yaml",
         validation_alias=AliasChoices("AI_MODEL_TRACKER_CONFIG"),
     )
     model_track_persist: bool = Field(default=True, validation_alias=AliasChoices("AI_MODEL_TRACK_PERSIST"))
+    model_enable_tracking: bool = Field(default=True, validation_alias=AliasChoices("AI_MODEL_ENABLE_TRACKING"))
+    model_snapshot_track_max_age_seconds: float = Field(
+        default=3.0,
+        ge=0.1,
+        le=10.0,
+        validation_alias=AliasChoices("AI_MODEL_SNAPSHOT_TRACK_MAX_AGE_SECONDS"),
+    )
+    model_snapshot_track_min_iou: float = Field(
+        default=0.08,
+        ge=0,
+        le=1.0,
+        validation_alias=AliasChoices("AI_MODEL_SNAPSHOT_TRACK_MIN_IOU"),
+    )
+    model_snapshot_track_max_center_distance: float = Field(
+        default=0.8,
+        ge=0.1,
+        le=3.0,
+        validation_alias=AliasChoices("AI_MODEL_SNAPSHOT_TRACK_MAX_CENTER_DISTANCE"),
+    )
+    model_snapshot_track_velocity_alpha: float = Field(
+        default=0.65,
+        ge=0,
+        le=1.0,
+        validation_alias=AliasChoices("AI_MODEL_SNAPSHOT_TRACK_VELOCITY_ALPHA"),
+    )
+    model_preload_on_startup: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AI_MODEL_PRELOAD_ON_STARTUP"),
+    )
+    model_runtime_autoinstall: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("AI_MODEL_RUNTIME_AUTOINSTALL"),
+    )
     model_label_aliases: Annotated[dict[str, list[str]], NoDecode] = Field(
         default_factory=lambda: {
             "weapon": [
                 "weapon",
+                "other_weapon",
                 "gun",
                 "knife",
                 "scissor",
@@ -54,12 +149,41 @@ class Settings(BaseSettings):
                 "handgun",
                 "kitchen_knife",
                 "shotgun",
+                "revolver",
+                "machete",
+                "sword",
+                "assault_rifle",
+                "submachine_gun",
+                "machine_gun",
             ],
             "fire": ["fire", "flame"],
             "smoke": ["smoke"],
             "person": ["person"],
         },
         validation_alias=AliasChoices("AI_MODEL_LABEL_ALIASES"),
+    )
+    model_weapon_type_aliases: Annotated[dict[str, str], NoDecode] = Field(
+        default_factory=lambda: {
+            "weapon": "other_weapon",
+            "other_weapon": "other_weapon",
+            "knife": "knife",
+            "kitchen_knife": "knife",
+            "machete": "machete",
+            "sword": "sword",
+            "scissor": "scissors",
+            "scissors": "scissors",
+            "pistol": "pistol",
+            "handgun": "pistol",
+            "revolver": "pistol",
+            "shotgun": "shotgun",
+            "rifle": "rifle",
+            "assault_rifle": "rifle",
+            "submachine_gun": "firearm",
+            "machine_gun": "firearm",
+            "gun": "firearm",
+            "firearm": "firearm",
+        },
+        validation_alias=AliasChoices("AI_MODEL_WEAPON_TYPE_ALIASES"),
     )
     recognition_backend: str = Field(default="hash", validation_alias=AliasChoices("AI_RECOGNITION_BACKEND"))
     recognition_embedding_model: str = Field(
@@ -72,25 +196,157 @@ class Settings(BaseSettings):
         default=0.35, ge=0, le=1, validation_alias=AliasChoices("AI_PERSON_CONFIDENCE_THRESHOLD")
     )
     weapon_confidence_threshold: float = Field(
-        default=0.25, ge=0, le=1, validation_alias=AliasChoices("AI_WEAPON_CONFIDENCE_THRESHOLD")
+        default=0.15, ge=0, le=1, validation_alias=AliasChoices("AI_WEAPON_CONFIDENCE_THRESHOLD")
     )
     fire_confidence_threshold: float = Field(
-        default=0.25, ge=0, le=1, validation_alias=AliasChoices("AI_FIRE_CONFIDENCE_THRESHOLD")
+        default=0.10, ge=0, le=1, validation_alias=AliasChoices("AI_FIRE_CONFIDENCE_THRESHOLD")
     )
     smoke_confidence_threshold: float = Field(
         default=0.05, ge=0, le=1, validation_alias=AliasChoices("AI_SMOKE_CONFIDENCE_THRESHOLD")
     )
+    smoke_max_person_coverage: float = Field(
+        default=0.70,
+        ge=0,
+        le=1,
+        validation_alias=AliasChoices("AI_SMOKE_MAX_PERSON_COVERAGE"),
+    )
     recognition_match_threshold: float = Field(
-        default=0.82,
+        default=0.55,
         ge=0,
         le=1,
         validation_alias=AliasChoices("AI_RECOGNITION_MATCH_THRESHOLD"),
     )
     recognition_min_margin: float = Field(
-        default=0.08,
+        default=0.05,
         ge=0,
         le=1,
         validation_alias=AliasChoices("AI_RECOGNITION_MIN_MARGIN"),
+    )
+    recognition_live_hold_seconds: float = Field(
+        default=3.0,
+        ge=0.1,
+        le=10.0,
+        validation_alias=AliasChoices("AI_RECOGNITION_LIVE_HOLD_SECONDS"),
+    )
+    recognition_live_max_unknown_frames: int = Field(
+        default=2,
+        ge=0,
+        le=10,
+        validation_alias=AliasChoices("AI_RECOGNITION_LIVE_MAX_UNKNOWN_FRAMES"),
+    )
+    recognition_refresh_seconds: float = Field(
+        default=0.5,
+        ge=0,
+        le=30.0,
+        validation_alias=AliasChoices("AI_RECOGNITION_REFRESH_SECONDS"),
+    )
+    recognition_known_refresh_seconds: float = Field(
+        default=1.0,
+        ge=0,
+        le=30.0,
+        validation_alias=AliasChoices("AI_RECOGNITION_KNOWN_REFRESH_SECONDS"),
+    )
+    recognition_cache_iou_threshold: float = Field(
+        default=0.45,
+        ge=0.1,
+        le=1.0,
+        validation_alias=AliasChoices("AI_RECOGNITION_CACHE_IOU_THRESHOLD"),
+    )
+    recognition_template_top_k: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        validation_alias=AliasChoices("AI_RECOGNITION_TEMPLATE_TOP_K"),
+    )
+    recognition_template_min_det_score: float = Field(
+        default=0.60,
+        ge=0,
+        le=1,
+        validation_alias=AliasChoices("AI_RECOGNITION_TEMPLATE_MIN_DET_SCORE"),
+    )
+    recognition_template_duplicate_similarity: float = Field(
+        default=0.9995,
+        ge=0.9,
+        le=1,
+        validation_alias=AliasChoices("AI_RECOGNITION_TEMPLATE_DUPLICATE_SIMILARITY"),
+    )
+    recognition_min_face_detection_score: float = Field(
+        default=0.50,
+        ge=0,
+        le=1,
+        validation_alias=AliasChoices("AI_RECOGNITION_MIN_FACE_DETECTION_SCORE"),
+    )
+    recognition_min_face_size: int = Field(
+        default=32,
+        ge=8,
+        le=1024,
+        validation_alias=AliasChoices("AI_RECOGNITION_MIN_FACE_SIZE"),
+    )
+    temporal_confirmation_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AI_TEMPORAL_CONFIRMATION_ENABLED"),
+    )
+    temporal_confirmation_max_gap_seconds: float = Field(
+        default=2.0,
+        ge=0.1,
+        le=10.0,
+        validation_alias=AliasChoices("AI_TEMPORAL_CONFIRMATION_MAX_GAP_SECONDS"),
+    )
+    temporal_confirmation_allowed_misses: int = Field(
+        default=1,
+        ge=0,
+        le=3,
+        validation_alias=AliasChoices("AI_TEMPORAL_CONFIRMATION_ALLOWED_MISSES"),
+    )
+    weapon_confirmation_frames: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        validation_alias=AliasChoices("AI_WEAPON_CONFIRMATION_FRAMES"),
+    )
+    fire_confirmation_frames: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        validation_alias=AliasChoices("AI_FIRE_CONFIRMATION_FRAMES"),
+    )
+    smoke_confirmation_frames: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        validation_alias=AliasChoices("AI_SMOKE_CONFIRMATION_FRAMES"),
+    )
+    recognition_confirmation_frames: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        validation_alias=AliasChoices("AI_RECOGNITION_CONFIRMATION_FRAMES"),
+    )
+    weapon_immediate_confidence: float = Field(
+        default=0.60, ge=0, le=1, validation_alias=AliasChoices("AI_WEAPON_IMMEDIATE_CONFIDENCE")
+    )
+    fire_immediate_confidence: float = Field(
+        default=0.65, ge=0, le=1, validation_alias=AliasChoices("AI_FIRE_IMMEDIATE_CONFIDENCE")
+    )
+    smoke_immediate_confidence: float = Field(
+        default=0.70, ge=0, le=1, validation_alias=AliasChoices("AI_SMOKE_IMMEDIATE_CONFIDENCE")
+    )
+    recognition_immediate_confidence: float = Field(
+        default=0.90,
+        ge=0,
+        le=1,
+        validation_alias=AliasChoices("AI_RECOGNITION_IMMEDIATE_CONFIDENCE"),
+    )
+    model_promotion_min_signatures: int = Field(
+        default=2,
+        ge=1,
+        validation_alias=AliasChoices("AI_MODEL_PROMOTION_MIN_SIGNATURES"),
+    )
+    model_promotion_weapon_min_recall: float = Field(
+        default=0.90,
+        ge=0,
+        le=1,
+        validation_alias=AliasChoices("AI_MODEL_PROMOTION_WEAPON_MIN_RECALL"),
     )
     recognition_embedding_dimensions: int = Field(
         default=16,
@@ -103,7 +359,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("AI_RECOGNITION_ALLOW_FALLBACK"),
     )
     recognition_insightface_model: str = Field(
-        default="buffalo_l",
+        default="buffalo_m",
         validation_alias=AliasChoices("AI_RECOGNITION_INSIGHTFACE_MODEL"),
     )
     recognition_insightface_providers: Annotated[list[str], NoDecode] = Field(
@@ -127,6 +383,10 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("AI_API_EVENT_CALLBACK_TOKEN"),
     )
     enable_event_callback: bool = Field(default=False, validation_alias=AliasChoices("AI_ENABLE_EVENT_CALLBACK"))
+    runtime_gate_report_path: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_RUNTIME_GATE_REPORT_PATH"),
+    )
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -140,6 +400,13 @@ class Settings(BaseSettings):
         "model_person_weapon_weights_path",
         "model_weapon_weights_path",
         "model_fire_smoke_weights_path",
+        "model_fire_weights_path",
+        "model_smoke_weights_path",
+        "model_weapon_promotion_path",
+        "model_fire_smoke_promotion_path",
+        "model_fire_promotion_path",
+        "model_smoke_promotion_path",
+        "runtime_gate_report_path",
         mode="before",
     )
     @classmethod
@@ -174,12 +441,35 @@ class Settings(BaseSettings):
             for detector, aliases in value.items()
         }
 
+    @field_validator("model_weapon_type_aliases", mode="before")
+    @classmethod
+    def normalize_weapon_type_aliases(cls, value: dict[str, str]) -> dict[str, str]:
+        return {
+            source.strip().lower().replace("-", "_").replace(" ", "_"): target
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+            for source, target in value.items()
+            if source.strip() and target.strip()
+        }
+
     @field_validator("recognition_insightface_providers", mode="before")
     @classmethod
     def normalize_provider_list(cls, value: str | list[str]) -> list[str]:
         if isinstance(value, str):
             return [provider.strip() for provider in value.split(",") if provider.strip()]
         return value
+
+    @field_validator("model_weapon_excluded_labels", mode="before")
+    @classmethod
+    def normalize_excluded_weapon_labels(cls, value: str | list[str]) -> list[str]:
+        labels = value.split(",") if isinstance(value, str) else value
+        return [
+            label.strip().lower().replace("-", "_").replace(" ", "_")
+            for label in labels
+            if label.strip()
+        ]
 
     @field_validator("recognition_insightface_det_size", mode="before")
     @classmethod
@@ -199,6 +489,8 @@ class Settings(BaseSettings):
             raise ValueError("Production mode does not allow the simulated inference backend.")
         if self.allow_backend_fallback:
             raise ValueError("Production mode requires AI_ALLOW_BACKEND_FALLBACK=false.")
+        if self.model_runtime_autoinstall:
+            raise ValueError("Production mode requires AI_MODEL_RUNTIME_AUTOINSTALL=false.")
         if self.recognition_backend != "insightface":
             raise ValueError("Production mode requires AI_RECOGNITION_BACKEND=insightface.")
         if self.recognition_allow_fallback:
@@ -207,7 +499,12 @@ class Settings(BaseSettings):
         required_paths = {
             "AI_MODEL_WEIGHTS_PATH": self.model_weights_path,
             "AI_MODEL_WEAPON_WEIGHTS_PATH": self.model_weapon_weights_path,
-            "AI_MODEL_FIRE_SMOKE_WEIGHTS_PATH": self.model_fire_smoke_weights_path,
+            "AI_MODEL_FIRE_WEIGHTS_PATH or AI_MODEL_FIRE_SMOKE_WEIGHTS_PATH": (
+                self.model_fire_weights_path or self.model_fire_smoke_weights_path
+            ),
+            "AI_MODEL_SMOKE_WEIGHTS_PATH or AI_MODEL_FIRE_SMOKE_WEIGHTS_PATH": (
+                self.model_smoke_weights_path or self.model_fire_smoke_weights_path
+            ),
         }
         for env_name, candidate in required_paths.items():
             if not candidate:
@@ -221,6 +518,38 @@ class Settings(BaseSettings):
         for env_name, candidate in optional_paths.items():
             if candidate and not Path(candidate).exists():
                 raise ValueError(f"{env_name} points to a missing file: {candidate}")
+
+        validate_promotion_manifest(
+            detector="weapon",
+            model_path=self.model_weapon_weights_path,
+            promotion_path=self.model_weapon_promotion_path,
+            min_signatures=self.model_promotion_min_signatures,
+            min_weapon_recall=self.model_promotion_weapon_min_recall,
+        )
+        if self.model_fire_weights_path:
+            validate_promotion_manifest(
+                detector="fire",
+                model_path=self.model_fire_weights_path,
+                promotion_path=self.model_fire_promotion_path,
+                min_signatures=self.model_promotion_min_signatures,
+                min_weapon_recall=self.model_promotion_weapon_min_recall,
+            )
+        if self.model_smoke_weights_path:
+            validate_promotion_manifest(
+                detector="smoke",
+                model_path=self.model_smoke_weights_path,
+                promotion_path=self.model_smoke_promotion_path,
+                min_signatures=self.model_promotion_min_signatures,
+                min_weapon_recall=self.model_promotion_weapon_min_recall,
+            )
+        if not self.model_fire_weights_path or not self.model_smoke_weights_path:
+            validate_promotion_manifest(
+                detector="fire_smoke",
+                model_path=self.model_fire_smoke_weights_path,
+                promotion_path=self.model_fire_smoke_promotion_path,
+                min_signatures=self.model_promotion_min_signatures,
+                min_weapon_recall=self.model_promotion_weapon_min_recall,
+            )
 
         if not self.api_event_callback_url:
             raise ValueError("Production mode requires AI_API_EVENT_CALLBACK_URL.")

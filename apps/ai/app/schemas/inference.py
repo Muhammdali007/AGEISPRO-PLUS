@@ -57,7 +57,9 @@ class InferenceBox(BaseModel):
     confidence: float = Field(ge=0, le=1)
     label: str = Field(min_length=1, max_length=64)
     object_label: str | None = Field(default=None, max_length=64)
+    source_model_path: str | None = Field(default=None, exclude=True)
     track_id: str | None = Field(default=None, max_length=64)
+    provisional: bool = False
     face_region: FaceRegion | None = None
     recognition: InferenceRecognition | None = None
     face_image_evidence: InlineEvidencePayload | None = None
@@ -77,6 +79,10 @@ class InferenceRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class InferenceBatchRequest(BaseModel):
+    requests: list[InferenceRequest] = Field(default_factory=list, min_length=1, max_length=64)
+
+
 class InferenceResult(BaseModel):
     camera_id: UUID
     model_name: str
@@ -87,6 +93,10 @@ class InferenceResult(BaseModel):
     detections: list[InferenceBox] = Field(default_factory=list)
     snapshot_evidence: InlineEvidencePayload | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class InferenceBatchResult(BaseModel):
+    results: list[InferenceResult] = Field(default_factory=list)
 
 
 class InferenceEventDispatchResult(BaseModel):

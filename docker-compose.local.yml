@@ -1,0 +1,21 @@
+services:
+  ai:
+    environment:
+      ENVIRONMENT: development
+      AI_RUNTIME_GATE_REPORT_PATH: /app/storage/runtime/runtime-gates.json
+
+  api:
+    ports: !reset []
+    volumes:
+      - ./apps/api/app:/app/app:ro
+      - ./apps/api/alembic:/app/alembic:ro
+      - ./storage:/app/storage
+    environment:
+      ENVIRONMENT: development
+      AUTO_CREATE_TABLES: "false"
+
+  web:
+    ports: !reset []
+    environment:
+      NEXT_PUBLIC_API_URL: /backend
+      API_PROXY_TARGET: http://api:8000

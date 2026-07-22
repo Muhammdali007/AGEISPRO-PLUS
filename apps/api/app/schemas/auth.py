@@ -1,7 +1,5 @@
 from pydantic import BaseModel, Field
 
-from app.models.user import UserRole
-
 
 class LoginRequest(BaseModel):
     email: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", max_length=320)
@@ -11,8 +9,9 @@ class LoginRequest(BaseModel):
 class SignupRequest(BaseModel):
     email: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", max_length=320)
     full_name: str = Field(min_length=1, max_length=160)
-    role: UserRole
     password: str = Field(min_length=8, max_length=128)
+
+    model_config = {"extra": "forbid"}
 
 
 class TokenPair(BaseModel):
@@ -22,4 +21,17 @@ class TokenPair(BaseModel):
 
 
 class RefreshRequest(BaseModel):
-    refresh_token: str
+    refresh_token: str | None = None
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", max_length=320)
+
+
+class PasswordResetRequest(BaseModel):
+    token: str = Field(min_length=32, max_length=256)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class PasswordResetResponse(BaseModel):
+    detail: str

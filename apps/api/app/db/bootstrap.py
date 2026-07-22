@@ -38,9 +38,16 @@ async def bootstrap_database() -> None:
 
 
 def _run_migrations() -> None:
-    api_root = Path(PROJECT_ROOT) / "apps" / "api"
+    api_root = _api_runtime_root()
     alembic_config = Config(str(api_root / "alembic.ini"))
     alembic_config.set_main_option("sqlalchemy.url", settings.database_url)
     alembic_config.set_main_option("script_location", str(api_root / "alembic"))
     alembic_config.set_main_option("prepend_sys_path", str(api_root))
     command.upgrade(alembic_config, "head")
+
+
+def _api_runtime_root() -> Path:
+    source_checkout_root = Path(PROJECT_ROOT) / "apps" / "api"
+    if (source_checkout_root / "app").is_dir():
+        return source_checkout_root
+    return Path(PROJECT_ROOT)

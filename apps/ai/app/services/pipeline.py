@@ -1,8 +1,12 @@
 import json
+import base64
+from io import BytesIO
+from time import perf_counter
 from urllib import error, request
 
 from app.core.config import settings
 from app.schemas.inference import (
+    FaceRegion,
     InferenceBox,
     InlineEvidencePayload,
     InferenceEventDispatchResult,
@@ -14,6 +18,8 @@ from app.services.backends import (
     build_inference_backend,
 )
 from app.services.recognition import FaceRecognitionService
+from app.services.temporal_confirmation import TemporalDetectionConfirmation
+from app.services.temporal_tracking import TemporalBoxTracker
 
 
 class InferencePipeline:
@@ -25,11 +31,38 @@ class InferencePipeline:
             else None
         )
         self.recognition = FaceRecognitionService()
+        self.box_tracker = TemporalBoxTracker()
+        self.temporal_confirmation = TemporalDetectionConfirmation()
+
+    def warmup(self) -> None:
+        self.primary_backend.warmup()
+        if self.fallback_backend and self.fallback_backend.backend_name != self.primary_backend.backend_name:
+            self.fallback_backend.warmup()
 
     def run(self, payload: InferenceRequest) -> InferenceResult:
         backend_result, backend_metadata = self._run_backend(payload)
-        detections = backend_result.detections
+        return self._build_result(payload, backend_result, backend_metadata)
+
+    def run_batch(self, payloads: list[InferenceRequest]) -> list[InferenceResult]:
+        backend_results, backend_metadata = self._run_backend_batch(payloads)
+        return [
+            self._build_result(payload, backend_result, backend_metadata)
+            for payload, backend_result in zip(payloads, backend_results)
+        ]
+
+    def _build_result(
+        self,
+        payload: InferenceRequest,
+        backend_result,
+        backend_metadata: dict[str, object],
+    ) -> InferenceResult:
+        postprocess_started_at = perf_counter()
+        detections = self.box_tracker.update(payload, backend_result.detections)
+        recognition_started_at = perf_counter()
         detections = self._apply_recognition(payload, detections)
+        recognition_ms = round((perf_counter() - recognition_started_at) * 1000, 2)
+        detections, suppressed_candidates = self.temporal_confirmation.filter(payload, detections)
+        postprocess_ms = round((perf_counter() - postprocess_started_at) * 1000, 2)
         return InferenceResult(
             camera_id=payload.camera_id,
             model_name=backend_result.model_name,
@@ -47,6 +80,14 @@ class InferencePipeline:
                 "frame_reference": payload.frame_reference,
                 "source_type": payload.source_type,
                 "recognition_enabled": payload.recognition_enabled,
+                "snapshot_tracking_enabled": (
+                    settings.model_enable_tracking
+                    and payload.occurrence_hint
+                    in {"continuous_monitoring", "dashboard_live_scan"}
+                ),
+                "recognition_ms": recognition_ms,
+                "postprocess_ms": postprocess_ms,
+                "temporal_candidates_suppressed": suppressed_candidates,
             },
         )
 
@@ -121,6 +162,7 @@ class InferencePipeline:
                         },
                     }
                     for detection in result.detections
+                    if not detection.provisional
                 ],
                 "metadata": result.metadata,
             }
@@ -169,35 +211,39 @@ class InferencePipeline:
                 },
             )
 
+    def _run_backend_batch(self, payloads: list[InferenceRequest]):
+        try:
+            return self.primary_backend.infer_batch(payloads), {}
+        except InferenceBackendError as exc:
+            if not self.fallback_backend or self.fallback_backend.backend_name == self.primary_backend.backend_name:
+                raise
+            fallback_results = self.fallback_backend.infer_batch(payloads)
+            return (
+                fallback_results,
+                {
+                    "backend_fallback": True,
+                    "backend_warning": str(exc),
+                    "fallback_backend": self.fallback_backend.backend_name,
+                },
+            )
+
     def _apply_recognition(
         self, payload: InferenceRequest, detections: list[InferenceBox]
     ) -> list[InferenceBox]:
         if not payload.recognition_enabled:
             return detections
 
-        enriched: list[InferenceBox] = []
-        for detection in detections:
-            if detection.label != "person":
-                enriched.append(detection)
-                continue
-
-            face_region, recognition = self.recognition.enrich_detection(payload, detection)
-            effective_label = "known_person" if recognition.status == "known" else "unknown_person"
-            enriched.append(
-                InferenceBox(
-                    x1=detection.x1,
-                    y1=detection.y1,
-                    x2=detection.x2,
-                    y2=detection.y2,
-                    confidence=detection.confidence,
-                    label=effective_label,
-                    track_id=detection.track_id,
-                    face_region=face_region,
-                    recognition=recognition,
-                    face_image_evidence=self._face_evidence(payload, detection),
-                )
+        enriched = self.recognition.enrich_detections(payload, detections)
+        return [
+            detection.model_copy(
+                update={
+                    "face_image_evidence": self._face_evidence(payload, detection.face_region)
+                }
             )
-        return enriched
+            if detection.face_region is not None
+            else detection
+            for detection in enriched
+        ]
 
     @staticmethod
     def _snapshot_evidence(payload: InferenceRequest) -> InlineEvidencePayload | None:
@@ -211,11 +257,27 @@ class InferencePipeline:
     @staticmethod
     def _face_evidence(
         payload: InferenceRequest,
-        detection: InferenceBox,
+        face_region: FaceRegion,
     ) -> InlineEvidencePayload | None:
-        if not payload.include_evidence or not payload.frame_content_base64 or detection.label != "person":
+        if not payload.include_evidence or not payload.frame_content_base64:
             return None
-        return InlineEvidencePayload(
-            content_base64=payload.frame_content_base64,
-            content_type=payload.frame_content_type or "image/jpeg",
-        )
+        try:
+            from PIL import Image
+
+            frame_bytes = base64.b64decode(payload.frame_content_base64, validate=True)
+            image = Image.open(BytesIO(frame_bytes)).convert("RGB")
+            left = max(int(face_region.x1), 0)
+            top = max(int(face_region.y1), 0)
+            right = min(int(face_region.x2), image.width)
+            bottom = min(int(face_region.y2), image.height)
+            if right <= left or bottom <= top:
+                return None
+
+            buffer = BytesIO()
+            image.crop((left, top, right, bottom)).save(buffer, format="JPEG", quality=90)
+            return InlineEvidencePayload(
+                content_base64=base64.b64encode(buffer.getvalue()).decode("utf-8"),
+                content_type="image/jpeg",
+            )
+        except (OSError, ValueError):
+            return None

@@ -1,5 +1,6 @@
 from fastapi.encoders import jsonable_encoder
 
+from app.core.audit import redact_audit_metadata
 from app.models.user import User
 from app.repositories.audit_logs import AuditLogRepository
 
@@ -24,5 +25,5 @@ class AuditLogService:
             action=action,
             resource_type=resource_type,
             resource_id=resource_id,
-            metadata=jsonable_encoder(metadata or {}),
+            metadata=redact_audit_metadata(jsonable_encoder(metadata or {})),
         )

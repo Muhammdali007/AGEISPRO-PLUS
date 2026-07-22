@@ -1,12 +1,17 @@
+from __future__ import annotations
+
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import Boolean, DateTime, Enum, Index, Integer, JSON, String, Text, Uuid
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+if TYPE_CHECKING:
+    from app.models.camera_secret import CameraSecret
 
 
 class CameraSourceType(StrEnum):
@@ -32,6 +37,8 @@ class Camera(Base):
     name: Mapped[str] = mapped_column(String(160), index=True)
     source_type: Mapped[CameraSourceType] = mapped_column(Enum(CameraSourceType), index=True)
     source: Mapped[str] = mapped_column(Text)
+    source_redacted: Mapped[bool] = mapped_column(Boolean, default=False)
+    credentials_rotation_required: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[CameraStatus] = mapped_column(
         Enum(CameraStatus), default=CameraStatus.unknown, index=True
     )
@@ -50,4 +57,11 @@ class Camera(Base):
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
         onupdate=lambda: datetime.now(UTC),
+    )
+    secret: Mapped[CameraSecret | None] = relationship(
+        "CameraSecret",
+        back_populates="camera",
+        cascade="all, delete-orphan",
+        uselist=False,
+        passive_deletes=True,
     )
