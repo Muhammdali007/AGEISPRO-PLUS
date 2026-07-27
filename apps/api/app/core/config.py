@@ -230,10 +230,16 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("API_CONTINUOUS_DETECTION_SCHEDULER_INTERVAL_MS"),
     )
     continuous_detection_hazard_interval_seconds: float = Field(
-        default=0.25,
+        default=0.5,
         ge=0.25,
         le=30.0,
         validation_alias=AliasChoices("API_CONTINUOUS_DETECTION_HAZARD_INTERVAL_SECONDS"),
+    )
+    continuous_detection_recognition_interval_seconds: float = Field(
+        default=4.0,
+        ge=0.5,
+        le=30.0,
+        validation_alias=AliasChoices("API_CONTINUOUS_DETECTION_RECOGNITION_INTERVAL_SECONDS"),
     )
     detection_duplicate_window_seconds: int = Field(
         default=15,
@@ -265,6 +271,12 @@ class Settings(BaseSettings):
         le=3600,
         validation_alias=AliasChoices("API_MANUAL_CAMERA_SCAN_COOLDOWN_SECONDS"),
     )
+    file_video_scan_step_seconds: float = Field(
+        default=0.5,
+        ge=0.05,
+        le=30.0,
+        validation_alias=AliasChoices("API_FILE_VIDEO_SCAN_STEP_SECONDS"),
+    )
     camera_overlay_ttl_seconds: int = Field(
         default=5,
         ge=2,
@@ -290,7 +302,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("API_EVENT_CLIP_AFTER_SECONDS"),
     )
     event_clip_fps: int = Field(
-        default=2,
+        default=10,
         ge=1,
         le=30,
         validation_alias=AliasChoices("API_EVENT_CLIP_FPS"),
@@ -318,6 +330,55 @@ class Settings(BaseSettings):
         ge=10,
         le=3600,
         validation_alias=AliasChoices("API_INCIDENT_CLEANUP_INTERVAL_SECONDS"),
+    )
+    video_rag_enabled: bool = Field(
+        default=False, validation_alias=AliasChoices("VIDEO_RAG_ENABLED", "API_VIDEO_RAG_ENABLED")
+    )
+    video_rag_ollama_url: str = Field(
+        default="http://127.0.0.1:11434",
+        validation_alias=AliasChoices("VIDEO_RAG_OLLAMA_URL", "API_VIDEO_RAG_OLLAMA_URL"),
+    )
+    video_rag_vision_model: str = Field(
+        default="gemma3:4b", validation_alias=AliasChoices("VIDEO_RAG_VISION_MODEL")
+    )
+    video_rag_embedding_model: str = Field(
+        default="embeddinggemma", validation_alias=AliasChoices("VIDEO_RAG_EMBEDDING_MODEL")
+    )
+    video_rag_embedding_dimensions: int = Field(
+        default=768, ge=1, le=2000, validation_alias=AliasChoices("VIDEO_RAG_EMBEDDING_DIMENSIONS")
+    )
+    video_rag_visual_indexing_enabled: bool = Field(
+        default=True, validation_alias=AliasChoices("VIDEO_RAG_VISUAL_INDEXING_ENABLED")
+    )
+    video_rag_request_timeout_seconds: int = Field(
+        default=120, ge=5, le=900, validation_alias=AliasChoices("VIDEO_RAG_REQUEST_TIMEOUT_SECONDS")
+    )
+    video_rag_query_timeout_seconds: int = Field(
+        default=30, ge=5, le=180, validation_alias=AliasChoices("VIDEO_RAG_QUERY_TIMEOUT_SECONDS")
+    )
+    video_rag_worker_interval_seconds: int = Field(
+        default=15, ge=2, le=3600, validation_alias=AliasChoices("VIDEO_RAG_WORKER_INTERVAL_SECONDS")
+    )
+    video_rag_lease_seconds: int = Field(
+        default=600, ge=30, le=3600, validation_alias=AliasChoices("VIDEO_RAG_LEASE_SECONDS")
+    )
+    video_rag_max_attempts: int = Field(
+        default=3, ge=1, le=10, validation_alias=AliasChoices("VIDEO_RAG_MAX_ATTEMPTS")
+    )
+    video_rag_max_frames: int = Field(
+        default=6, ge=1, le=12, validation_alias=AliasChoices("VIDEO_RAG_MAX_FRAMES")
+    )
+    video_rag_evidence_read_timeout_seconds: int = Field(
+        default=15,
+        ge=3,
+        le=120,
+        validation_alias=AliasChoices("VIDEO_RAG_EVIDENCE_READ_TIMEOUT_SECONDS"),
+    )
+    video_rag_default_limit: int = Field(
+        default=5, ge=1, le=20, validation_alias=AliasChoices("VIDEO_RAG_DEFAULT_LIMIT")
+    )
+    video_rag_min_relevance: float = Field(
+        default=0.25, ge=0, le=1, validation_alias=AliasChoices("VIDEO_RAG_MIN_RELEVANCE")
     )
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")

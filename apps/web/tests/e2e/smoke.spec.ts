@@ -7,11 +7,13 @@ const refreshToken = "playwright-refresh-token";
 const tinyPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 let liveScanRequestCount = 0;
 let liveScanRequestedDetectors: string[] = [];
+let liveSafetyScanObserved = false;
 let browserCameraMode = false;
 
 test.beforeEach(async ({ page }) => {
   liveScanRequestCount = 0;
   liveScanRequestedDetectors = [];
+  liveSafetyScanObserved = false;
   browserCameraMode = false;
   await stubBackend(page);
   await clearBrowserState(page);
@@ -50,7 +52,6 @@ test("allows an administrator to sign in and navigate the main dashboard routes"
   await loginViaUi(page);
 
   await expect(page.getByRole("heading", { name: "Live operations workspace" })).toBeVisible();
-  await expect(page.getByText("Phase 9 optimization", { exact: true })).toBeVisible();
   const soundAlerts = page.getByRole("button", { name: "Enable sound alerts" });
   await expect(soundAlerts).toBeVisible();
   await soundAlerts.click();
@@ -86,6 +87,21 @@ test("loads the phase 9 analytics dashboard with optimization telemetry", async 
   await expect(page.getByRole("heading", { name: "Optimization report" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Recent audit log" })).toBeVisible();
   await expect(page.getByText("alerts.clear")).toBeVisible();
+});
+
+test("asks about incidents and renders grounded evidence", async ({ page }) => {
+  await loginViaUi(page);
+  await page.goto("/dashboard/ask-incidents");
+
+  await expect(page.getByRole("heading", { name: "Ask about incidents" })).toBeVisible();
+  await page.getByLabel("Question").fill("What happened at the North Gate?");
+  await page.getByRole("button", { name: "Ask incidents" }).click();
+
+  await expect(page.getByText(/A fire incident was detected/)).toBeVisible();
+  await expect(page.getByRole("link", { name: /Review protected evidence/ })).toHaveAttribute(
+    "href",
+    "/dashboard/incidents/incident-1"
+  );
 });
 
 test("uses server overlays without duplicating inference for server-readable cameras", async ({ page }) => {
@@ -125,7 +141,7 @@ test("transports browser-camera frames and bridges one missed person scan", asyn
   await expect.poll(() => liveScanRequestCount, { timeout: 8_000 }).toBeGreaterThanOrEqual(2);
   await page.waitForTimeout(100);
 
-  expect(liveScanRequestedDetectors).toEqual(["person", "weapon", "fire", "smoke"]);
+  expect(liveSafetyScanObserved).toBe(true);
   await expect(page.getByText("Person", { exact: true })).toBeVisible();
   await expect(page.getByText("Weapon", { exact: true })).toHaveCount(0);
 });
@@ -283,6 +299,9 @@ async function stubBackend(page: Page) {
       liveScanRequestCount += 1;
       const requestPayload = route.request().postDataJSON() as { requested_detectors?: string[] };
       liveScanRequestedDetectors = requestPayload.requested_detectors ?? [];
+      liveSafetyScanObserved ||= ["weapon", "fire", "smoke"].every((detector) =>
+        liveScanRequestedDetectors.includes(detector)
+      );
       const detections = liveScanRequestCount === 2
         ? []
         : [
@@ -344,6 +363,49 @@ async function stubBackend(page: Page) {
           updated_at: "2026-07-07T11:45:00Z"
         }
       ]);
+      return;
+    }
+
+    if (path === "/api/v1/video-rag/status") {
+      await fulfillJson(route, {
+        enabled: true,
+        latest_indexed_at: "2026-07-07T12:00:00Z",
+        ready: 1,
+        queued: 0,
+        processing: 0,
+        failed: 0
+      });
+      return;
+    }
+
+    if (path === "/api/v1/video-rag/query" && method === "POST") {
+      await fulfillJson(route, {
+        answer: "A fire incident was detected [incident:incident-1].",
+        warnings: [],
+        freshness: {
+          latest_indexed_at: "2026-07-07T12:00:00Z",
+          ready: 1,
+          queued: 0,
+          processing: 0,
+          failed: 0
+        },
+        evidence: [
+          {
+            incident_id: "incident-1",
+            camera_id: "camera-1",
+            camera_name: "North Gate",
+            occurred_at: "2026-07-07T11:45:00Z",
+            detection_type: "fire",
+            confidence: 0.91,
+            matched_excerpt: "Detector event fire at North Gate. Model-generated visual summary: visible flame.",
+            relevance_score: 0.88,
+            clip_start_seconds: 2.5,
+            clip_end_seconds: 2.5,
+            snapshot_url: "/api/v1/incidents/incident-1/snapshot",
+            clip_url: "/api/v1/incidents/incident-1/clip"
+          }
+        ]
+      });
       return;
     }
 

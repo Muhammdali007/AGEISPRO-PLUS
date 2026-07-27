@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.db.metadata import Base
 from app.db.session import get_db
 from app.main import app
-from app.models.camera import CameraSourceType
+from app.models.camera import CameraSourceType, CameraStatus
 from app.models.incident import DetectionType, IncidentPriority
 from app.models.user import UserRole
 from app.repositories.cameras import CameraRepository
@@ -21,6 +21,7 @@ from app.repositories.users import UserRepository
 from app.schemas.cameras import CameraCreate, CameraDetectionScanResponse, CameraDetectionScanSummary
 from app.schemas.detections import DetectionBoundingBox
 from app.schemas.incidents import IncidentCreate
+from app.services.camera_detection import CameraDetectionService
 from app.services.camera_network_policy import CameraNetworkPolicy
 from app.schemas.users import UserCreate
 from app.services.camera_streams import CameraStreamingService
@@ -99,6 +100,43 @@ async def test_live_monitor_route_returns_multi_feed_summary(
     assert payload["summary"]["browser_ready"] == 2
     assert payload["summary"]["groups"] == {"records": 1, "yard": 1}
     assert {entry["camera"]["name"] for entry in payload["entries"]} == {"Parking", "Archive"}
+
+
+@pytest.mark.asyncio
+async def test_deleting_camera_preserves_incidents_and_hides_camera(
+    client: AsyncClient, session: AsyncSession
+) -> None:
+    access_token = await _create_user_and_login(client, session, UserRole.supervisor)
+    cameras = CameraRepository(session)
+    incidents = IncidentRepository(session)
+    camera = await cameras.create(
+        CameraCreate(
+            name="Retired Gate",
+            source_type=CameraSourceType.http,
+            source="http://camera/retired",
+        )
+    )
+    incident = await incidents.create(
+        IncidentCreate(
+            camera_id=camera.id,
+            detection_type=DetectionType.person,
+            priority=IncidentPriority.low,
+            confidence=0.82,
+        )
+    )
+
+    response = await client.delete(
+        f"/api/v1/cameras/{camera.id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+
+    assert response.status_code == 204
+    assert camera.deleted_at is not None
+    assert camera.status == CameraStatus.disabled
+    assert camera.detection_enabled is False
+    assert await cameras.get(camera.id) is None
+    assert all(item.id != camera.id for item in await cameras.list())
+    assert (await incidents.get(incident.id)) is not None
 
 
 @pytest.mark.asyncio
@@ -302,7 +340,15 @@ async def test_camera_overlays_return_recent_server_detection_boxes(
                 {"x1": 10, "y1": 20, "x2": 120, "y2": 220, "label": "person"},
                 {"x1": 30, "y1": 40, "x2": 90, "y2": 120, "label": "face"},
             ],
-            recognized_identity={"status": "known", "identity_label": "Dana Rivers"},
+            recognized_identity={
+                "status": "known",
+                "identity_label": "Dana Rivers",
+                "match_confidence": 0.93,
+                "person_type": "employee",
+                "department": "Security",
+                "reference_id": "EMP-1042",
+                "title": "Shift Lead",
+            },
             metadata={"track_id": "trk-42", "detection_metadata": {"department": "Security"}},
         )
     )
@@ -317,8 +363,48 @@ async def test_camera_overlays_return_recent_server_detection_boxes(
     assert overlay["detection_type"] == "known_person"
     assert overlay["track_id"] == "trk-42"
     assert overlay["identity_label"] == "Dana Rivers"
+    assert overlay["match_confidence"] == 0.93
+    assert overlay["person_type"] == "employee"
+    assert overlay["department"] == "Security"
+    assert overlay["reference_id"] == "EMP-1042"
+    assert overlay["title"] == "Shift Lead"
     assert overlay["bounding_box"]["label"] == "person"
     assert overlay["face_bounding_box"]["label"] == "face"
+
+
+def test_detection_summary_exposes_known_person_profile_and_match_confidence() -> None:
+    summary = CameraDetectionService._summarize_detections(
+        [
+            {
+                "label": "known_person",
+                "confidence": 0.88,
+                "x1": 10,
+                "y1": 20,
+                "x2": 110,
+                "y2": 220,
+                "recognition": {
+                    "status": "known",
+                    "identity_id": "f634caa1-513f-46bc-bf1c-4f563d75844d",
+                    "identity_label": "Dana Rivers",
+                    "match_confidence": 0.94,
+                    "metadata": {
+                        "person_type": "employee",
+                        "department": "Security",
+                        "reference_id": "EMP-1042",
+                        "title": "Shift Lead",
+                    },
+                },
+            }
+        ]
+    )[0]
+
+    assert summary.recognition_status == "known"
+    assert summary.identity_label == "Dana Rivers"
+    assert summary.match_confidence == 0.94
+    assert summary.person_type == "employee"
+    assert summary.department == "Security"
+    assert summary.reference_id == "EMP-1042"
+    assert summary.title == "Shift Lead"
 
 
 @pytest.mark.asyncio
@@ -449,7 +535,7 @@ async def test_supervisor_can_run_repeated_transient_live_scans(
     assert first.status_code == 200
     assert second.status_code == 200
     assert len(received_payloads) == 2
-    assert all(payload.include_evidence is False for payload in received_payloads)
+    assert all(payload.include_evidence is True for payload in received_payloads)
     assert all(payload.occurrence_hint == "dashboard_live_scan" for payload in received_payloads)
 
 
@@ -491,7 +577,7 @@ async def test_file_camera_can_scan_the_current_browser_playback_frame(
     assert response.status_code == 200
     assert len(received_payloads) == 1
     assert received_payloads[0].frame_content_base64 == "ZmFrZS1mcmFtZQ=="
-    assert received_payloads[0].include_evidence is False
+    assert received_payloads[0].include_evidence is True
     assert received_payloads[0].occurrence_hint == "dashboard_live_scan"
 
 

@@ -8,6 +8,7 @@ import {
   ChevronRight,
   LogOut,
   Shield,
+  ScanSearch,
   Siren,
   Users
 } from "lucide-react";
@@ -26,6 +27,7 @@ const navigation = [
   { href: "/dashboard", label: "Overview", icon: Shield },
   { href: "/dashboard/cameras", label: "Cameras", icon: Camera },
   { href: "/dashboard/incidents", label: "Incidents", icon: Siren },
+  { href: "/dashboard/ask-incidents", label: "Ask incidents", icon: ScanSearch },
   { href: "/dashboard/persons", label: "Persons", icon: Users },
   { href: "/dashboard/users", label: "Users", icon: Users },
   { href: "/dashboard/analytics", label: "Analytics", icon: ChartColumn }
@@ -184,8 +186,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
           <header className="rounded-[28px] border border-white/10 bg-panel/70 px-5 py-4 shadow-xl backdrop-blur">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
               <div>
-                <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Phase 9 optimization</p>
-                <h1 className="mt-2 text-2xl font-semibold">Live operations workspace</h1>
+                <h1 className="text-2xl font-semibold">Live operations workspace</h1>
               </div>
               <div className="flex flex-wrap items-center gap-3">
                 <SoundAlertSystem ref={soundAlertSystemRef} />

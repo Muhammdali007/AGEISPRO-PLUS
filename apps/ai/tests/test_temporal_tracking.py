@@ -27,6 +27,17 @@ def _person(x1: float, x2: float) -> InferenceBox:
     )
 
 
+def _threat(label: str, x1: float, x2: float) -> InferenceBox:
+    return InferenceBox(
+        x1=x1,
+        y1=20,
+        x2=x2,
+        y2=120,
+        confidence=0.8,
+        label=label,
+    )
+
+
 def test_snapshot_tracker_keeps_ids_during_fast_crossing_motion(monkeypatch) -> None:
     times = iter((0.0, 0.2, 0.4))
     monkeypatch.setattr("app.services.temporal_tracking.monotonic", lambda: next(times))
@@ -75,3 +86,22 @@ def test_snapshot_tracker_does_not_recycle_ids_after_track_expiry(monkeypatch) -
 
     assert first[0].track_id == "pe-t1"
     assert replacement[0].track_id == "pe-t2"
+
+
+def test_snapshot_tracker_assigns_stable_ids_to_threat_objects(monkeypatch) -> None:
+    times = iter((0.0, 0.2))
+    monkeypatch.setattr("app.services.temporal_tracking.monotonic", lambda: next(times))
+    tracker = TemporalBoxTracker()
+    request = _request()
+
+    first = tracker.update(
+        request,
+        [_person(0, 100), _threat("weapon", 150, 210), _threat("fire", 300, 390)],
+    )
+    second = tracker.update(
+        request,
+        [_person(8, 108), _threat("weapon", 158, 218), _threat("fire", 310, 400)],
+    )
+
+    assert [item.track_id for item in first] == ["pe-t1", "we-t2", "fi-t3"]
+    assert [item.track_id for item in second] == ["pe-t1", "we-t2", "fi-t3"]

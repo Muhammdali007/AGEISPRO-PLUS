@@ -13,6 +13,7 @@ from app.models.password_reset_token import PasswordResetToken
 from app.models.person import Person
 from app.models.user import User, UserRole
 from app.models.user_session import UserSession
+from app.models.video_rag import VideoRagChunk, VideoRagIndex, VideoRagIndexStatus
 
 __all__ = [
     "Alert",
@@ -32,4 +33,7 @@ __all__ = [
     "User",
     "UserSession",
     "UserRole",
+    "VideoRagChunk",
+    "VideoRagIndex",
+    "VideoRagIndexStatus",
 ]

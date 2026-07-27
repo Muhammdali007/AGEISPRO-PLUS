@@ -52,3 +52,10 @@ def test_sound_alert_defaults_require_three_unknown_person_scans() -> None:
     assert settings.sound_alert_unknown_scan_threshold == 3
     assert settings.sound_alert_unknown_cooldown_seconds == 30
     assert settings.sound_alert_hazard_cooldown_seconds == 10
+
+
+def test_continuous_detection_defaults_use_lightweight_fast_lane() -> None:
+    settings = Settings()
+
+    assert settings.continuous_detection_hazard_interval_seconds == 0.5
+    assert settings.continuous_detection_recognition_interval_seconds == 4.0

@@ -51,25 +51,27 @@ class TemporalBoxTracker:
             for track in self._tracks.get(camera_key, [])
             if now - track.observed_at <= settings.model_snapshot_track_max_age_seconds
         ]
-        person_indices = [
-            index for index, detection in enumerate(detections) if detection.label == "person"
+        tracked_indices = [
+            index
+            for index, detection in enumerate(detections)
+            if detection.label in {"person", "weapon", "fire", "smoke"}
         ]
-        if not person_indices:
+        if not tracked_indices:
             self._tracks[camera_key] = previous
             self._prune(now)
             return detections
 
-        assignments = self._associate(previous, detections, person_indices, now)
+        assignments = self._associate(previous, detections, tracked_indices, now)
         updated = list(detections)
         next_tracks: list[SnapshotTrack] = []
         matched_track_indices: set[int] = set()
 
-        for detection_index in person_indices:
+        for detection_index in tracked_indices:
             detection = detections[detection_index]
             track_index = assignments.get(detection_index)
             if track_index is None:
                 track = SnapshotTrack(
-                    track_id=self._new_track_id(camera_key),
+                    track_id=self._new_track_id(camera_key, detection.label),
                     detection=detection.model_copy(deep=True),
                     observed_at=now,
                 )
@@ -83,7 +85,7 @@ class TemporalBoxTracker:
             next_tracks.append(track)
 
         # Keep briefly missed tracks so a single detector dropout does not
-        # replace a person's identity as soon as they reappear.
+        # replace a tracked object's identity as soon as it reappears.
         next_tracks.extend(
             track for index, track in enumerate(previous) if index not in matched_track_indices
         )
@@ -103,6 +105,8 @@ class TemporalBoxTracker:
             predicted = self._predict(track, now)
             for detection_index in detection_indices:
                 detection = detections[detection_index]
+                if detection.label != track.detection.label:
+                    continue
                 score = self._association_score(predicted, detection)
                 if score is not None:
                     candidates.append((score, track_index, detection_index))
@@ -185,10 +189,16 @@ class TemporalBoxTracker:
             velocity=velocity,
         )
 
-    def _new_track_id(self, camera_key: str) -> str:
+    def _new_track_id(self, camera_key: str, label: str) -> str:
         next_number = self._next_track_number.get(camera_key, 0) + 1
         self._next_track_number[camera_key] = next_number
-        return f"pe-t{next_number}"
+        prefix = {
+            "person": "pe",
+            "weapon": "we",
+            "fire": "fi",
+            "smoke": "sm",
+        }.get(label, "tr")
+        return f"{prefix}-t{next_number}"
 
     @staticmethod
     def _normalized_center_distance(first: InferenceBox, second: InferenceBox) -> float:

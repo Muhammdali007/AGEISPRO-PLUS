@@ -15,26 +15,151 @@ import { formatDateTime, labelize, statusTone } from "@/lib/format";
 import { cn } from "@/lib/cn";
 
 const LIVE_DETECTION_EMPTY_GRACE_MS = 2500;
-const LIVE_WEAPON_SCAN_INTERVAL_MS = 200;
-const LIVE_HAZARD_SCAN_INTERVAL_MS = 200;
+// Keep safety models on a sub-second lane while running the considerably more
+// expensive face-recognition work less often.
+const LIVE_WEAPON_SCAN_INTERVAL_MS = 500;
+const LIVE_HAZARD_SCAN_INTERVAL_MS = 500;
+const LIVE_RECOGNITION_SCAN_INTERVAL_MS = 2000;
+const LIVE_KNOWN_IDENTITY_HOLD_MS = 3500;
 const LIVE_PERSON_DETECTION_TYPES = new Set(["person", "known_person", "unknown_person"]);
+const LIVE_RECOGNITION_OBSERVED_AT_KEY = "client_recognition_observed_at_ms";
+
+function boxIoU(
+  left: CameraDetectionScanSummary["bounding_box"],
+  right: CameraDetectionScanSummary["bounding_box"]
+) {
+  if (!left || !right) {
+    return 0;
+  }
+
+  const intersectionWidth = Math.max(0, Math.min(left.x2, right.x2) - Math.max(left.x1, right.x1));
+  const intersectionHeight = Math.max(0, Math.min(left.y2, right.y2) - Math.max(left.y1, right.y1));
+  const intersection = intersectionWidth * intersectionHeight;
+  const leftArea = Math.max(0, left.x2 - left.x1) * Math.max(0, left.y2 - left.y1);
+  const rightArea = Math.max(0, right.x2 - right.x1) * Math.max(0, right.y2 - right.y1);
+  const union = leftArea + rightArea - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
+function projectFaceBox(
+  faceBox: CameraDetectionScanSummary["face_bounding_box"],
+  previousPersonBox: CameraDetectionScanSummary["bounding_box"],
+  currentPersonBox: CameraDetectionScanSummary["bounding_box"]
+) {
+  if (!faceBox || !previousPersonBox || !currentPersonBox) {
+    return faceBox;
+  }
+
+  const previousWidth = previousPersonBox.x2 - previousPersonBox.x1;
+  const previousHeight = previousPersonBox.y2 - previousPersonBox.y1;
+  if (previousWidth <= 0 || previousHeight <= 0) {
+    return faceBox;
+  }
+
+  const currentWidth = currentPersonBox.x2 - currentPersonBox.x1;
+  const currentHeight = currentPersonBox.y2 - currentPersonBox.y1;
+  return {
+    ...faceBox,
+    x1: currentPersonBox.x1 + ((faceBox.x1 - previousPersonBox.x1) / previousWidth) * currentWidth,
+    y1: currentPersonBox.y1 + ((faceBox.y1 - previousPersonBox.y1) / previousHeight) * currentHeight,
+    x2: currentPersonBox.x1 + ((faceBox.x2 - previousPersonBox.x1) / previousWidth) * currentWidth,
+    y2: currentPersonBox.y1 + ((faceBox.y2 - previousPersonBox.y1) / previousHeight) * currentHeight
+  };
+}
+
+function retainPersonIdentity(
+  current: CameraDetectionScanSummary,
+  previousPeople: CameraDetectionScanSummary[]
+) {
+  if (
+    current.detection_type !== "person"
+    || current.recognition_status
+    || current.identity_label
+  ) {
+    return current;
+  }
+
+  const identityCandidates = previousPeople.filter(
+    (detection) =>
+      detection.detection_type === "known_person"
+      || detection.detection_type === "unknown_person"
+      || Boolean(detection.recognition_status)
+  );
+  const trackMatch = current.track_id
+    ? identityCandidates.find((detection) => detection.track_id === current.track_id)
+    : undefined;
+  const spatialMatch = identityCandidates
+    .map((detection) => ({ detection, overlap: boxIoU(current.bounding_box, detection.bounding_box) }))
+    .filter(({ overlap }) => overlap >= 0.35)
+    .sort((left, right) => right.overlap - left.overlap)[0]?.detection;
+  const previousIdentity = trackMatch ?? spatialMatch;
+  if (!previousIdentity) {
+    return current;
+  }
+
+  return {
+    ...current,
+    detection_type: previousIdentity.detection_type,
+    recognition_status: previousIdentity.recognition_status,
+    identity_label: previousIdentity.identity_label,
+    face_bounding_box: projectFaceBox(
+      previousIdentity.face_bounding_box,
+      previousIdentity.bounding_box,
+      current.bounding_box
+    ),
+    metadata: {
+      ...previousIdentity.metadata,
+      ...current.metadata,
+      recognition_carried_forward: true
+    }
+  };
+}
 
 function mergeLiveDetectionFrame(
   previous: CameraDetectionScanSummary[] | null,
   incoming: CameraDetectionScanSummary[],
   requestedDetectors: string[]
 ) {
+  const observedAt = Date.now();
+  const previousPeople = (previous ?? []).filter((detection) =>
+    LIVE_PERSON_DETECTION_TYPES.has(detection.detection_type)
+  );
   const currentThreats = incoming.filter(
     (detection) => !LIVE_PERSON_DETECTION_TYPES.has(detection.detection_type)
   );
-  const currentPeople = incoming.filter((detection) =>
-    LIVE_PERSON_DETECTION_TYPES.has(detection.detection_type)
+  const currentPeople = incoming
+    .filter((detection) => LIVE_PERSON_DETECTION_TYPES.has(detection.detection_type))
+    .map((detection) => detection.recognition_status
+      ? {
+          ...detection,
+          metadata: {
+            ...detection.metadata,
+            [LIVE_RECOGNITION_OBSERVED_AT_KEY]: observedAt
+          }
+        }
+      : detection)
+    .map((detection) => retainPersonIdentity(detection, previousPeople));
+  const retainedKnownLabels = new Set(
+    currentPeople
+      .filter((detection) => detection.recognition_status === "known")
+      .map((detection) => detection.identity_label)
+      .filter(Boolean)
   );
+  const unmatchedKnownPeople = previousPeople.filter((detection) => {
+    if (
+      detection.recognition_status !== "known"
+      || !detection.identity_label
+      || retainedKnownLabels.has(detection.identity_label)
+    ) {
+      return false;
+    }
+    const rawObservedAt = detection.metadata[LIVE_RECOGNITION_OBSERVED_AT_KEY];
+    return typeof rawObservedAt === "number"
+      && observedAt - rawObservedAt <= LIVE_KNOWN_IDENTITY_HOLD_MS;
+  });
   const retainedPeople = currentPeople.length > 0
-    ? currentPeople
-    : (previous ?? []).filter((detection) =>
-        LIVE_PERSON_DETECTION_TYPES.has(detection.detection_type)
-      );
+    ? [...currentPeople, ...unmatchedKnownPeople]
+    : previousPeople;
   const requested = new Set(requestedDetectors);
   const incomingThreatTypes = new Set(currentThreats.map((detection) => detection.detection_type));
   const retainedUnscannedThreats = (previous ?? []).filter((detection) =>
@@ -95,6 +220,7 @@ export default function CameraDetailPage() {
   const liveScanPendingRef = useRef(false);
   const lastLiveWeaponScanRef = useRef(0);
   const lastLiveHazardScanRef = useRef(0);
+  const lastLiveRecognitionScanRef = useRef(0);
   const liveDetectionsRef = useRef<CameraDetectionScanSummary[] | null>(null);
   const [liveDetections, setLiveDetections] = useState<CameraDetectionScanSummary[] | null>(null);
   const [liveScanStatus, setLiveScanStatus] = useState<{
@@ -289,6 +415,13 @@ export default function CameraDetailPage() {
     // frames. This keeps inference latency from turning into video latency.
     const intervalMs = Math.max(200, Math.round(1000 / Math.max(1, liveScanInferenceFps)));
     let nextScan: number | undefined;
+    // The first readable preview frame must run every safety detector. Delaying
+    // the hazard lane here made a newly visible fire/smoke/weapon wait before
+    // it could even receive its first observation.
+    const laneStartedAt = performance.now();
+    lastLiveWeaponScanRef.current = laneStartedAt - LIVE_WEAPON_SCAN_INTERVAL_MS;
+    lastLiveHazardScanRef.current = laneStartedAt - LIVE_HAZARD_SCAN_INTERVAL_MS;
+    lastLiveRecognitionScanRef.current = laneStartedAt;
 
     function cancelOverlayExpiry() {
       if (overlayExpiry !== undefined) {
@@ -371,12 +504,7 @@ export default function CameraDetailPage() {
         const scanClock = performance.now();
         const weaponScanDue = scanClock - lastLiveWeaponScanRef.current >= LIVE_WEAPON_SCAN_INTERVAL_MS;
         const hazardScanDue = scanClock - lastLiveHazardScanRef.current >= LIVE_HAZARD_SCAN_INTERVAL_MS;
-        if (weaponScanDue) {
-          lastLiveWeaponScanRef.current = scanClock;
-        }
-        if (hazardScanDue) {
-          lastLiveHazardScanRef.current = scanClock;
-        }
+        const recognitionScanDue = scanClock - lastLiveRecognitionScanRef.current >= LIVE_RECOGNITION_SCAN_INTERVAL_MS;
         const requestedDetectors = [
           "person",
           ...(weaponScanDue ? ["weapon"] : []),
@@ -388,8 +516,23 @@ export default function CameraDetailPage() {
           // All safety detectors share the low-latency lane. Threat candidates
           // are visible immediately; alerts still require temporal confirmation.
           requested_detectors: requestedDetectors,
+          recognition_enabled: recognitionScanDue,
           occurrence_hint: "dashboard_live_scan"
         });
+        // Measure each specialist lane from completion. If a combined scan
+        // itself takes longer than its interval, measuring from start makes
+        // every following request combined as well and starves person-only
+        // frames indefinitely.
+        const scanCompletedAt = performance.now();
+        if (weaponScanDue) {
+          lastLiveWeaponScanRef.current = scanCompletedAt;
+        }
+        if (hazardScanDue) {
+          lastLiveHazardScanRef.current = scanCompletedAt;
+        }
+        if (recognitionScanDue) {
+          lastLiveRecognitionScanRef.current = scanCompletedAt;
+        }
         if (!stopped) {
           const currentDetections = scaleDetectionsToSource(result.detections, frame);
           const mergedDetections = mergeLiveDetectionFrame(
@@ -444,7 +587,7 @@ export default function CameraDetailPage() {
       }
     }
 
-    scheduleNextScan(500);
+    scheduleNextScan(0);
 
     return () => {
       stopped = true;

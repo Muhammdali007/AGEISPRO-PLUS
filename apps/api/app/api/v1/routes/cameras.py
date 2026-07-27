@@ -355,11 +355,11 @@ async def run_camera_live_scan(
         )
 
     # The browser transports the exact frame currently displayed for local
-    # devices and recorded files. Inference remains server-owned. These frames
-    # are transient, so do not persist full-frame evidence on every preview pass.
+    # devices and recorded files. Inference remains server-owned. Evidence is
+    # retained only when the scan produces a confirmed incident.
     live_payload = payload.model_copy(
         update={
-            "include_evidence": False,
+            "include_evidence": True,
             "occurrence_hint": "dashboard_live_scan",
         }
     )
@@ -433,6 +433,8 @@ def _incident_to_overlay(incident) -> CameraDetectionOverlayRead | None:
 
     recognized_identity = incident.recognized_identity or {}
     detection_metadata = incident.metadata_.get("detection_metadata", {})
+    if not isinstance(detection_metadata, dict):
+        detection_metadata = {}
     return CameraDetectionOverlayRead(
         incident_id=incident.id,
         occurred_at=incident.occurred_at,
@@ -440,10 +442,16 @@ def _incident_to_overlay(incident) -> CameraDetectionOverlayRead | None:
         confidence=incident.confidence,
         track_id=incident.metadata_.get("track_id"),
         recognition_status=recognized_identity.get("status"),
+        identity_id=recognized_identity.get("identity_id"),
         identity_label=recognized_identity.get("identity_label"),
+        match_confidence=recognized_identity.get("match_confidence"),
+        person_type=recognized_identity.get("person_type") or detection_metadata.get("person_type"),
+        department=recognized_identity.get("department") or detection_metadata.get("department"),
+        reference_id=recognized_identity.get("reference_id") or detection_metadata.get("reference_id"),
+        title=recognized_identity.get("title") or detection_metadata.get("title"),
         bounding_box=_box_to_summary(primary_box),
         face_bounding_box=_box_to_summary(face_box),
-        metadata=detection_metadata if isinstance(detection_metadata, dict) else {},
+        metadata=detection_metadata,
     )
 
 

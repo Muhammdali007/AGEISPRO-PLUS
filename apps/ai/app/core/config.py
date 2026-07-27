@@ -52,6 +52,18 @@ class Settings(BaseSettings):
         le=1.0,
         validation_alias=AliasChoices("AI_MODEL_WEAPON_MAX_FRAME_COVERAGE"),
     )
+    model_weapon_general_fallback_confidence: float = Field(
+        default=0.72,
+        ge=0,
+        le=1,
+        validation_alias=AliasChoices("AI_MODEL_WEAPON_GENERAL_FALLBACK_CONFIDENCE"),
+    )
+    model_generic_weapon_min_confidence: float = Field(
+        default=0.65,
+        ge=0,
+        le=1,
+        validation_alias=AliasChoices("AI_MODEL_GENERIC_WEAPON_MIN_CONFIDENCE"),
+    )
     model_fire_smoke_weights_path: str | None = Field(
         default=None,
         validation_alias=AliasChoices("AI_MODEL_FIRE_SMOKE_WEIGHTS_PATH"),
@@ -95,6 +107,12 @@ class Settings(BaseSettings):
         ge=1,
         le=1000,
         validation_alias=AliasChoices("AI_MODEL_MAX_DETECTIONS"),
+    )
+    model_max_threat_detections_per_type: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        validation_alias=AliasChoices("AI_MODEL_MAX_THREAT_DETECTIONS_PER_TYPE"),
     )
     model_tracker_config: str = Field(
         default="bytetrack.yaml",
@@ -196,10 +214,10 @@ class Settings(BaseSettings):
         default=0.35, ge=0, le=1, validation_alias=AliasChoices("AI_PERSON_CONFIDENCE_THRESHOLD")
     )
     weapon_confidence_threshold: float = Field(
-        default=0.15, ge=0, le=1, validation_alias=AliasChoices("AI_WEAPON_CONFIDENCE_THRESHOLD")
+        default=0.25, ge=0, le=1, validation_alias=AliasChoices("AI_WEAPON_CONFIDENCE_THRESHOLD")
     )
     fire_confidence_threshold: float = Field(
-        default=0.10, ge=0, le=1, validation_alias=AliasChoices("AI_FIRE_CONFIDENCE_THRESHOLD")
+        default=0.07, ge=0, le=1, validation_alias=AliasChoices("AI_FIRE_CONFIDENCE_THRESHOLD")
     )
     smoke_confidence_threshold: float = Field(
         default=0.05, ge=0, le=1, validation_alias=AliasChoices("AI_SMOKE_CONFIDENCE_THRESHOLD")
@@ -210,8 +228,38 @@ class Settings(BaseSettings):
         le=1,
         validation_alias=AliasChoices("AI_SMOKE_MAX_PERSON_COVERAGE"),
     )
+    smoke_person_conflict_min_confidence: float = Field(
+        default=0.35,
+        ge=0,
+        le=1,
+        validation_alias=AliasChoices("AI_SMOKE_PERSON_CONFLICT_MIN_CONFIDENCE"),
+    )
+    threat_edge_strip_margin_ratio: float = Field(
+        default=0.04,
+        ge=0,
+        le=0.20,
+        validation_alias=AliasChoices("AI_THREAT_EDGE_STRIP_MARGIN_RATIO"),
+    )
+    threat_edge_strip_max_width_ratio: float = Field(
+        default=0.18,
+        ge=0.01,
+        le=0.50,
+        validation_alias=AliasChoices("AI_THREAT_EDGE_STRIP_MAX_WIDTH_RATIO"),
+    )
+    threat_edge_strip_min_height_ratio: float = Field(
+        default=0.45,
+        ge=0.05,
+        le=1.0,
+        validation_alias=AliasChoices("AI_THREAT_EDGE_STRIP_MIN_HEIGHT_RATIO"),
+    )
+    threat_edge_strip_min_aspect_ratio: float = Field(
+        default=4.0,
+        ge=1.0,
+        le=20.0,
+        validation_alias=AliasChoices("AI_THREAT_EDGE_STRIP_MIN_ASPECT_RATIO"),
+    )
     recognition_match_threshold: float = Field(
-        default=0.55,
+        default=0.50,
         ge=0,
         le=1,
         validation_alias=AliasChoices("AI_RECOGNITION_MATCH_THRESHOLD"),
@@ -235,13 +283,13 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("AI_RECOGNITION_LIVE_MAX_UNKNOWN_FRAMES"),
     )
     recognition_refresh_seconds: float = Field(
-        default=0.5,
+        default=2.0,
         ge=0,
         le=30.0,
         validation_alias=AliasChoices("AI_RECOGNITION_REFRESH_SECONDS"),
     )
     recognition_known_refresh_seconds: float = Field(
-        default=1.0,
+        default=5.0,
         ge=0,
         le=30.0,
         validation_alias=AliasChoices("AI_RECOGNITION_KNOWN_REFRESH_SECONDS"),
@@ -371,7 +419,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("AI_RECOGNITION_INSIGHTFACE_CTX_ID"),
     )
     recognition_insightface_det_size: Annotated[tuple[int, int], NoDecode] = Field(
-        default=(640, 640),
+        default=(320, 320),
         validation_alias=AliasChoices("AI_RECOGNITION_INSIGHTFACE_DET_SIZE"),
     )
     api_event_callback_url: str | None = Field(

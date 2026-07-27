@@ -5,7 +5,7 @@ OpenVINO model directories, while the original `.pt` checkpoints remain availabl
 
 - `yolo11s_openvino_model`: person detection.
 - `weapon-v2_openvino_model`: the expanded single-class weapon detector.
-- `fire-smoke-v3-320_openvino_model`: the promoted fire detector (with a smoke fallback class).
+- `fire-smoke-v3_openvino_model`: the 640-pixel fire detector (with a smoke fallback class).
 - `smoke_openvino_model`: the smoke specialist.
 
 `AI_MODEL_FIRE_WEIGHTS_PATH` and `AI_MODEL_SMOKE_WEIGHTS_PATH` can route fire and smoke to separate
@@ -13,9 +13,11 @@ checkpoints. Pointing all three hazard paths at the same combined checkpoint gro
 model invocation. If either class-specific setting is empty, it falls back to
 `AI_MODEL_FIRE_SMOKE_WEIGHTS_PATH`.
 
-The smoke specialist is intentionally routed separately. On the 400-image independent v5 holdout
+The smoke specialist is intentionally routed separately. Fire uses the 640-pixel export so flames
+that occupy a small part of a camera frame retain enough detail for inference. On the 400-image
+independent v5 holdout,
 at the 0.10 runtime threshold, it reached 0.444 precision and 0.091 recall (20 true positives). The
-combined model's sampled smoke path reached 0.286 precision and 0.018 recall. The combined v3-320
+combined model's sampled smoke path reached 0.286 precision and 0.018 recall. The combined v3
 model remains selected for fire because it outperformed the available fire specialist. These are
 checkpoint-selection measurements, not production camera acceptance results.
 
@@ -39,10 +41,10 @@ latency. It keeps a bounded per-camera backlog and dispatches up to
 is capped by `API_CONTINUOUS_DETECTION_MAX_PENDING_PER_CAMERA`, so one slow camera can no longer pile
 up unbounded work.
 
-Every fast scan runs person and weapon detection. Fire and smoke use a lower-frequency hazard lane
-controlled by `API_CONTINUOUS_DETECTION_HAZARD_INTERVAL_SECONDS` (0.25 seconds locally). At the
-default 5 FPS camera setting this puts weapon, fire, smoke, and person detection on the same practical
-cadence. The AI endpoint runs blocking model work in a worker thread
+Every fast scan runs person and weapon detection. Fire and smoke use a sub-second hazard lane
+controlled by `API_CONTINUOUS_DETECTION_HAZARD_INTERVAL_SECONDS` (0.5 seconds by default). This stays
+inside the temporal-confirmation window, allowing a borderline hazard to confirm on the next pass
+instead of expiring between observations. The AI endpoint runs blocking model work in a worker thread
 behind a single inference lock, so health checks and the async event loop remain responsive while
 the non-thread-safe tracker/model state stays serialized.
 
@@ -169,7 +171,7 @@ OpenVINO checkpoint improved mAP50 from 0.249 to 0.294 and recall from 0.284 to 
 The July 19 runtime calibration found that the old 0.15 weapon threshold produced only 0.251
 precision and 0.422 recall on that validation split. The single-frame precision gate selected a
 0.45 operating point with 0.701 precision but only 0.184 recall. Development continuous monitoring
-uses the high-recall 0.15 candidate point behind immediate provisional overlays, two-frame temporal
+uses a 0.25 candidate floor behind immediate provisional overlays, two-frame temporal
 confirmation, and oversized-box rejection. This exposes a possible weapon on its first weak frame
 while preventing a one-frame candidate from creating an alert. A separate representative CCTV
 holdout is still required; this calibration is not a production acceptance result.

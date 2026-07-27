@@ -38,6 +38,7 @@ class InferencePipeline:
         self.primary_backend.warmup()
         if self.fallback_backend and self.fallback_backend.backend_name != self.primary_backend.backend_name:
             self.fallback_backend.warmup()
+        self.recognition.warmup()
 
     def run(self, payload: InferenceRequest) -> InferenceResult:
         backend_result, backend_metadata = self._run_backend(payload)

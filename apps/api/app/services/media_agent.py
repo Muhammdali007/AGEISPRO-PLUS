@@ -29,6 +29,8 @@ class MediaAgentError(Exception):
 class MediaFrame:
     content_base64: str
     content_type: str
+    source_position_seconds: float | None = None
+    source_duration_seconds: float | None = None
 
 
 class LocalSubprocessMediaAgent:
@@ -40,12 +42,14 @@ class LocalSubprocessMediaAgent:
         source: str | int,
         *,
         display_source: str | int | None = None,
+        position_seconds: float | None = None,
     ) -> MediaFrame:
         return self._invoke(
             {
                 "action": "capture_opencv_frame",
                 "source": source,
                 "display_source": display_source,
+                "position_seconds": position_seconds,
             }
         )
 
@@ -111,7 +115,12 @@ class LocalSubprocessMediaAgent:
                 detail="Isolated media agent did not return a valid frame payload.",
             )
 
-        return MediaFrame(content_base64=content_base64, content_type=content_type)
+        return MediaFrame(
+            content_base64=content_base64,
+            content_type=content_type,
+            source_position_seconds=_optional_float(parsed.get("source_position_seconds")),
+            source_duration_seconds=_optional_float(parsed.get("source_duration_seconds")),
+        )
 
 
 def _api_runtime_root() -> Path:
@@ -128,16 +137,22 @@ def run_media_request(payload: dict[str, object]) -> dict[str, object]:
     if action == "capture_opencv_frame":
         source = payload.get("source")
         display_source = payload.get("display_source")
+        position_seconds = payload.get("position_seconds")
         if not isinstance(source, (str, int)):
             raise MediaAgentError("Media agent expected a string or integer camera source.", 400)
-        frame_content_base64, frame_content_type = _capture_opencv_frame(
+        if position_seconds is not None and not isinstance(position_seconds, (int, float)):
+            raise MediaAgentError("Media frame position must be a number of seconds.", 400)
+        frame_content_base64, frame_content_type, frame_position, duration = _capture_opencv_frame(
             source,
             display_source=display_source if isinstance(display_source, (str, int)) else None,
+            position_seconds=float(position_seconds) if position_seconds is not None else None,
             network_policy=network_policy,
         )
         return {
             "frame_content_base64": frame_content_base64,
             "frame_content_type": frame_content_type,
+            "source_position_seconds": frame_position,
+            "source_duration_seconds": duration,
         }
 
     if action == "capture_http_frame":
@@ -164,8 +179,9 @@ def _capture_opencv_frame(
     source: str | int,
     *,
     display_source: str | int | None,
+    position_seconds: float | None = None,
     network_policy: CameraNetworkPolicy,
-) -> tuple[str, str]:
+) -> tuple[str, str, float | None, float | None]:
     if isinstance(source, str):
         parsed = urlparse(source)
         scheme = parsed.scheme.lower()
@@ -181,6 +197,10 @@ def _capture_opencv_frame(
 
     capture = cv2.VideoCapture(source)
     try:
+        if position_seconds is not None:
+            if position_seconds < 0:
+                raise MediaAgentError("Media frame position cannot be negative.", 400)
+            capture.set(cv2.CAP_PROP_POS_MSEC, position_seconds * 1000.0)
         ok, frame = capture.read()
         if not ok or frame is None:
             rendered_source = display_source if display_source is not None else source
@@ -188,7 +208,16 @@ def _capture_opencv_frame(
         encoded, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         if not encoded:
             raise MediaAgentError("Unable to encode the captured camera frame.", 500)
-        return base64.b64encode(buffer.tobytes()).decode("utf-8"), "image/jpeg"
+        frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+        duration = frame_count / fps if frame_count > 0 and fps > 0 else None
+        frame_position = float(capture.get(cv2.CAP_PROP_POS_MSEC) or 0) / 1000.0
+        return (
+            base64.b64encode(buffer.tobytes()).decode("utf-8"),
+            "image/jpeg",
+            frame_position,
+            duration,
+        )
     finally:
         capture.release()
 
@@ -201,7 +230,12 @@ def _capture_http_frame(
     network_policy: CameraNetworkPolicy,
 ) -> tuple[str, str]:
     if _looks_like_video_frame_source(source):
-        return _capture_opencv_frame(source, display_source=source_descriptor, network_policy=network_policy)
+        content, content_type, _, _ = _capture_opencv_frame(
+            source,
+            display_source=source_descriptor,
+            network_policy=network_policy,
+        )
+        return content, content_type
 
     context = None
     if skip_tls_verification and source.lower().startswith("https://"):
@@ -231,7 +265,12 @@ def _capture_http_frame(
                 return base64.b64encode(frame).decode("utf-8"), "image/jpeg"
 
             if content_type.startswith("video/"):
-                return _capture_opencv_frame(source, display_source=source_descriptor, network_policy=network_policy)
+                content, frame_content_type, _, _ = _capture_opencv_frame(
+                    source,
+                    display_source=source_descriptor,
+                    network_policy=network_policy,
+                )
+                return content, frame_content_type
 
             raise MediaAgentError(
                 "This HTTP source is not serving a readable camera frame. Open the camera page and run the AI scan from the live preview.",
@@ -275,4 +314,10 @@ def _extract_jpeg_frame(response) -> bytes | None:  # type: ignore[no-untyped-de
             continue
         return bytes(buffer[start : end + 2])
 
+    return None
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
     return None

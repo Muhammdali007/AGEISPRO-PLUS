@@ -93,6 +93,7 @@ class InsightFaceEmbeddingBackend(FaceEmbeddingBackend):
         )
         self._app.prepare(
             ctx_id=settings.recognition_insightface_ctx_id,
+            det_thresh=settings.recognition_min_face_detection_score,
             det_size=settings.recognition_insightface_det_size,
         )
 

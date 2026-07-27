@@ -46,7 +46,7 @@ from app.services.detection_events import DetectionEventService
 from app.services.evidence_storage import EvidenceStorageService
 from app.services.auth import AuthService
 from app.services.incident_retention import IncidentRetentionService
-from app.services.ring_buffer_media import RingBufferMediaService
+from app.services.ring_buffer_media import BufferedFrame, RingBufferMediaService
 
 
 @pytest_asyncio.fixture
@@ -153,6 +153,58 @@ async def test_ring_buffer_media_service_signs_and_checksums_event_clip(
     assert event_clip["sha256"] == "225e2e71f6963695684cf5c2aef7d582fff76acb8c028ed8b79c9c52bc93495d"
     assert event_clip["signature"]
     assert event_clip["signature_algorithm"] == "hmac-sha256"
+    assert event_clip["duration_seconds"] >= 5
+    assert event_clip["minimum_duration_seconds"] == 5
+    assert event_clip["frame_count"] == 5
+    assert event_clip["padded_frame_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_ring_buffer_builds_five_second_clip_from_single_live_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    camera_id = uuid4()
+    service = RingBufferMediaService()
+    frame = base64.b64encode(b"jpeg-frame").decode("utf-8")
+    monkeypatch.setattr(settings, "event_clip_fps", 2)
+    monkeypatch.setattr(
+        RingBufferMediaService,
+        "_encode_mp4",
+        staticmethod(lambda frames: b"five-second-mp4"),
+    )
+    service.add_frame(camera_id, content_base64=frame, content_type="image/jpeg")
+
+    clip = await service.build_event_clip(camera_id)
+
+    assert clip is not None
+    event_clip = clip.metadata["event_clip"]
+    assert event_clip["frame_count"] == 10
+    assert event_clip["duration_seconds"] == 5
+    assert event_clip["padded_frame_count"] == 9
+
+
+def test_ring_buffer_resamples_real_preview_motion_across_five_seconds() -> None:
+    frames = [
+        BufferedFrame(
+            captured_at=datetime.now(UTC),
+            monotonic_at=float(second),
+            content_base64=f"frame-{second}",
+            content_type="image/jpeg",
+        )
+        for second in range(5)
+    ]
+
+    sampled, repeated = RingBufferMediaService._resample_clip_frames(
+        frames,
+        duration_seconds=5,
+        fps=2,
+    )
+
+    assert len(sampled) == 10
+    assert len({frame.content_base64 for frame in sampled}) == 5
+    assert sampled[0].content_base64 == "frame-0"
+    assert sampled[-1].content_base64 == "frame-4"
+    assert repeated == 5
 
 
 @pytest.mark.asyncio

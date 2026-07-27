@@ -1,5 +1,7 @@
 services:
   ai:
+    volumes:
+      - ./apps/ai/app:/app/app:ro
     environment:
       ENVIRONMENT: development
       AI_RUNTIME_GATE_REPORT_PATH: /app/storage/runtime/runtime-gates.json
@@ -13,6 +15,13 @@ services:
     environment:
       ENVIRONMENT: development
       AUTO_CREATE_TABLES: "false"
+
+  rag-worker:
+    volumes:
+      - ./apps/api/app:/app/app:ro
+      - ./storage:/app/storage
+    environment:
+      ENVIRONMENT: development
 
   web:
     ports: !reset []

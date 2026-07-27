@@ -104,11 +104,6 @@ class SoundAlertService:
                 if self._resolved_type(detection) is detection_type
             ]
             if not matching:
-                if detection_type.value in requested:
-                    # The detector ran and the hazard disappeared. A future
-                    # recurrence should alert immediately instead of waiting on
-                    # the previous episode's cooldown.
-                    state.hazard_last_alerted_at.pop(detection_type, None)
                 continue
 
             last_alerted_at = state.hazard_last_alerted_at.get(detection_type)

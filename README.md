@@ -99,6 +99,10 @@ Phase 10 adds production deployment:
 - Checksum-verified PostgreSQL and evidence backup/restore tooling.
 - A deployment, certificate renewal, monitoring, rollback, and recovery runbook.
 
+Incident Video RAG adds local, evidence-grounded natural-language search over retained incident clips,
+snapshots, metadata, identities, and operator notes. See [Incident Video RAG](docs/incident-video-rag.md)
+for Ollama setup, indexing behavior, privacy boundaries, and operational guidance.
+
 ## Project Layout
 
 ```text

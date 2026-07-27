@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alert import Alert, AlertStatus
@@ -173,6 +173,8 @@ class IncidentRepository:
         return incident
 
     async def archive(self, incident: Incident, *, reference_time: datetime | None = None) -> Incident:
+        from app.models.video_rag import VideoRagChunk, VideoRagIndex
+
         timestamp = reference_time or datetime.now(UTC)
         if incident.archived_at is None:
             incident.archived_at = timestamp
@@ -184,6 +186,12 @@ class IncidentRepository:
             update(Alert)
             .where(Alert.incident_id == incident.id)
             .values(status=AlertStatus.cleared, updated_at=timestamp)
+        )
+        await self.session.execute(
+            delete(VideoRagChunk).where(VideoRagChunk.incident_id == incident.id)
+        )
+        await self.session.execute(
+            delete(VideoRagIndex).where(VideoRagIndex.incident_id == incident.id)
         )
         await self.session.flush()
         await self.session.refresh(incident)

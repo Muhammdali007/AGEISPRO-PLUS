@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends build-essential curl libglib2.0-0 libgl1 libxcb1 \
+  && apt-get install -y --no-install-recommends build-essential curl ffmpeg libglib2.0-0 libgl1 libxcb1 \
   && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./
@@ -14,7 +14,7 @@ COPY app ./app
 COPY alembic.ini ./
 COPY alembic ./alembic
 
-RUN pip install --no-cache-dir -e ".[recognition]"
+RUN pip install --no-cache-dir -e ".[recognition,video-rag]"
 
 EXPOSE 8000
 

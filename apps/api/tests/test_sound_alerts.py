@@ -124,7 +124,12 @@ async def test_weapon_fire_and_smoke_alert_immediately_with_episode_cooldown() -
     clock.advance(1)
     assert await service.observe_scan(detections=hazards, **scan) == []
 
-    # A clear detector pass closes the episode, so recurrence is immediate.
+    # A clear detector pass can happen during model flicker, so it does not
+    # reset the sound cooldown by itself.
     assert await service.observe_scan(detections=[], **scan) == []
+    repeated = await service.observe_scan(detections=hazards[:1], **scan)
+    assert repeated == []
+
+    clock.advance(10)
     repeated = await service.observe_scan(detections=hazards[:1], **scan)
     assert [event["detection_type"] for event in repeated] == ["weapon"]

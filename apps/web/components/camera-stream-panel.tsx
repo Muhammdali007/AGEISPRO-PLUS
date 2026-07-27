@@ -8,6 +8,9 @@ import type { Camera, CameraDetectionScanSummary, CameraStreamDescriptor, Detect
 import { cn } from "@/lib/cn";
 
 const MAX_LIVE_CAPTURE_EDGE = 960;
+const MAX_RECORDED_VIDEO_CAPTURE_EDGE = 1280;
+const LIVE_CAPTURE_JPEG_QUALITY = 0.78;
+const RECORDED_VIDEO_CAPTURE_JPEG_QUALITY = 0.9;
 
 export type CapturedCameraFrame = {
   contentBase64: string;
@@ -59,11 +62,27 @@ export const CameraStreamPanel = forwardRef<CameraStreamPanelHandle, {
 
     try {
       if (videoRef.current && videoRef.current.videoWidth > 0 && videoRef.current.videoHeight > 0) {
-        return drawToBase64(videoRef.current, videoRef.current.videoWidth, videoRef.current.videoHeight);
+        return drawToBase64(
+          videoRef.current,
+          videoRef.current.videoWidth,
+          videoRef.current.videoHeight,
+          camera.source_type === "file"
+            ? MAX_RECORDED_VIDEO_CAPTURE_EDGE
+            : MAX_LIVE_CAPTURE_EDGE,
+          camera.source_type === "file"
+            ? RECORDED_VIDEO_CAPTURE_JPEG_QUALITY
+            : LIVE_CAPTURE_JPEG_QUALITY
+        );
       }
 
       if (imageRef.current && imageRef.current.naturalWidth > 0 && imageRef.current.naturalHeight > 0) {
-        return drawToBase64(imageRef.current, imageRef.current.naturalWidth, imageRef.current.naturalHeight);
+        return drawToBase64(
+          imageRef.current,
+          imageRef.current.naturalWidth,
+          imageRef.current.naturalHeight,
+          MAX_LIVE_CAPTURE_EDGE,
+          LIVE_CAPTURE_JPEG_QUALITY
+        );
       }
     } catch {
       // Cross-origin camera feeds can be displayed but not read through canvas.
@@ -352,7 +371,9 @@ function BrowserCameraPreview({
 function drawToBase64(
   element: HTMLVideoElement | HTMLImageElement,
   sourceWidth: number,
-  sourceHeight: number
+  sourceHeight: number,
+  maxCaptureEdge: number,
+  jpegQuality: number
 ) {
   const canvas = document.createElement("canvas");
   // Both YOLO and InsightFace ultimately analyze a bounded input. Resizing the
@@ -361,8 +382,8 @@ function drawToBase64(
   // the media's natural coordinate space by the camera page.
   const scale = Math.min(
     1,
-    MAX_LIVE_CAPTURE_EDGE / sourceWidth,
-    MAX_LIVE_CAPTURE_EDGE / sourceHeight
+    maxCaptureEdge / sourceWidth,
+    maxCaptureEdge / sourceHeight
   );
   canvas.width = Math.max(1, Math.round(sourceWidth * scale));
   canvas.height = Math.max(1, Math.round(sourceHeight * scale));
@@ -396,7 +417,7 @@ function drawToBase64(
           : null);
       };
       reader.readAsDataURL(blob);
-    }, "image/jpeg", 0.78);
+    }, "image/jpeg", jpegQuality);
   });
 }
 
@@ -455,19 +476,29 @@ function DetectionOverlay({
             return null;
           }
 
-          const palette = getDetectionPalette(kind === "face" ? "face" : detection.detection_type);
-          const confidence = `${Math.round(detection.confidence * 100)}%`;
-          const knownPersonDetails = buildKnownPersonSubtitle(detection);
-          const title = kind === "face"
-            ? detection.identity_label ?? "Face"
-            : formatDetectionLabel(box.label || detection.detection_type);
-          const subtitle = kind === "face"
-            ? detection.identity_label
-              ? knownPersonDetails
-              : "Face detected"
-            : detection.identity_label
-              ? `${detection.identity_label} | ${confidence}`
-              : confidence;
+          const palette = getDetectionPalette(
+            kind === "face" && detection.recognition_status
+              ? `${detection.recognition_status}_person`
+              : kind === "face" ? "face" : detection.detection_type
+          );
+          const confidence = formatConfidence(detection.confidence);
+          const identityDetails = buildPersonSubtitle(detection);
+          const title = detection.recognition_status === "known"
+            ? "Known Person"
+            : detection.recognition_status === "unknown"
+              ? "Unknown person"
+            : kind === "face"
+              ? "Face"
+              : formatDetectionLabel(box.label || detection.detection_type);
+          const subtitle = detection.recognition_status === "known"
+            ? ""
+            : kind === "face"
+            ? detection.recognition_status
+              ? identityDetails
+              : `Face detected | Confidence: ${confidence}`
+            : detection.recognition_status
+              ? identityDetails
+              : `Confidence: ${confidence}`;
 
           return (
             <div
@@ -481,7 +512,7 @@ function DetectionOverlay({
               }}
             >
               <div
-                className="absolute left-0 top-0 max-w-[220px] -translate-y-[calc(100%+8px)] rounded-xl border px-2.5 py-1.5 text-[11px] leading-tight backdrop-blur-sm"
+                className="absolute left-0 top-0 w-max max-w-[min(360px,90vw)] -translate-y-[calc(100%+8px)] rounded-xl border px-3 py-2 text-[11px] leading-snug backdrop-blur-sm"
                 style={{
                   borderColor: palette.border,
                   backgroundColor: palette.badge,
@@ -489,7 +520,9 @@ function DetectionOverlay({
                 }}
               >
                 <p className="font-semibold">{title}</p>
-                <p className="mt-0.5 text-[10px] opacity-90">{subtitle}</p>
+                {subtitle ? (
+                  <p className="mt-1 whitespace-normal text-[10px] opacity-90">{subtitle}</p>
+                ) : null}
               </div>
             </div>
           );
@@ -501,8 +534,8 @@ function DetectionOverlay({
           <p className="text-[10px] uppercase tracking-[0.18em] text-emerald-200/80">Known Person</p>
           {knownPeople.slice(0, 2).map((person, index) => (
             <p key={`${person.track_id ?? person.identity_label}-${index}`} className="mt-2 leading-relaxed">
-              {person.identity_label}
-              {buildKnownPersonSubtitle(person) ? ` | ${buildKnownPersonSubtitle(person)}` : ""}
+              <span className="font-semibold">{person.identity_label}</span>
+              {buildPersonSubtitle(person) ? ` | ${buildPersonSubtitle(person)}` : ""}
             </p>
           ))}
         </div>
@@ -529,14 +562,26 @@ function formatDetectionLabel(label: string) {
   return label.replaceAll("_", " ").replace(/\b\w/g, (match) => match.toUpperCase());
 }
 
-function buildKnownPersonSubtitle(detection: CameraDetectionScanSummary) {
-  const detailValues = [
-    readMetadataString(detection.metadata, "title"),
-    readMetadataString(detection.metadata, "department"),
-    readMetadataString(detection.metadata, "reference_id"),
-    readMetadataString(detection.metadata, "person_type")
-  ].filter(Boolean);
+function buildPersonSubtitle(detection: CameraDetectionScanSummary) {
+  const title = detection.title || readMetadataString(detection.metadata, "title");
+  const department = detection.department || readMetadataString(detection.metadata, "department");
+  const referenceId = detection.reference_id || readMetadataString(detection.metadata, "reference_id");
+  const personType = detection.person_type || readMetadataString(detection.metadata, "person_type");
+  const confidence = detection.match_confidence ?? detection.confidence;
+  const detailValues = detection.recognition_status === "known"
+    ? [
+        title ? `Title: ${title}` : "",
+        department ? `Department: ${department}` : "",
+        personType ? `Type: ${formatDetectionLabel(personType)}` : "",
+        referenceId ? `Reference ID: ${referenceId}` : "",
+        `Confidence: ${formatConfidence(confidence)}`
+      ].filter(Boolean)
+    : [`Confidence: ${formatConfidence(confidence)}`];
   return detailValues.join(" | ");
+}
+
+function formatConfidence(confidence: number) {
+  return `${Math.round(confidence * 100)}%`;
 }
 
 function readMetadataString(metadata: Record<string, unknown>, key: string) {

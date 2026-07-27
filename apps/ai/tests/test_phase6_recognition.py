@@ -14,7 +14,11 @@ from app.schemas.inference import (
 )
 from app.services.pipeline import InferencePipeline
 from app.services.recognition import FaceRecognitionService
-from app.services.face_embeddings import FaceEmbeddingResult, HashFaceEmbeddingBackend
+from app.services.face_embeddings import (
+    FaceEmbeddingError,
+    FaceEmbeddingResult,
+    HashFaceEmbeddingBackend,
+)
 
 
 def build_request(track_hint: str = "known") -> InferenceRequest:
@@ -388,6 +392,60 @@ def test_recognition_creates_known_person_from_unboxed_face(monkeypatch) -> None
     assert result[0].recognition.metadata["face_only_detection"] is True
 
 
+def test_recognition_adds_unassigned_face_when_person_box_used_another_face(monkeypatch) -> None:
+    class MixedFaceBackend:
+        def extract_embeddings(self, image_bytes: bytes) -> list[FaceEmbeddingResult]:
+            return [
+                FaceEmbeddingResult(
+                    vector=[1.0, 0.0],
+                    model_name="insightface-buffalo_m",
+                    backend_name="insightface",
+                    metadata={
+                        "backend": "insightface",
+                        "bbox": [30.0, 20.0, 70.0, 65.0],
+                        "det_score": 0.98,
+                    },
+                ),
+                FaceEmbeddingResult(
+                    vector=[0.0, 1.0],
+                    model_name="insightface-buffalo_m",
+                    backend_name="insightface",
+                    metadata={
+                        "backend": "insightface",
+                        "bbox": [330.0, 80.0, 390.0, 155.0],
+                        "det_score": 0.97,
+                    },
+                ),
+            ]
+
+    monkeypatch.setattr(FaceRecognitionService, "_build_backend", staticmethod(lambda: MixedFaceBackend()))
+    request = build_request("mixed-face").model_copy(
+        update={
+            "frame_content_base64": build_frame_base64(),
+            "frame_content_type": "image/jpeg",
+            "known_persons": [
+                KnownPersonProfile(
+                    person_id=uuid4(),
+                    full_name="First Face",
+                    face_profiles=[KnownPersonFaceProfile(face_id="first", embedding_vector=[1.0, 0.0])],
+                ),
+                KnownPersonProfile(
+                    person_id=uuid4(),
+                    full_name="Second Face",
+                    face_profiles=[KnownPersonFaceProfile(face_id="second", embedding_vector=[0.0, 1.0])],
+                ),
+            ],
+        }
+    )
+    person = InferenceBox(x1=0, y1=0, x2=120, y2=300, confidence=0.9, label="person")
+
+    result = FaceRecognitionService().enrich_detections(request, [person])
+
+    assert len(result) == 2
+    assert [item.recognition.identity_label for item in result] == ["First Face", "Second Face"]
+    assert result[1].recognition.metadata["face_only_detection"] is True
+
+
 def test_recognition_cache_follows_stable_track_during_fast_motion(monkeypatch) -> None:
     class BatchBackend:
         calls = 0
@@ -498,6 +556,23 @@ def test_recognition_cache_age_starts_after_face_analysis(monkeypatch) -> None:
 
     assert backend.calls == 1
     assert second.recognition and second.recognition.deduplicated is True
+
+
+def test_recognition_warmup_initializes_batch_backend(monkeypatch) -> None:
+    class WarmupBackend:
+        calls = 0
+
+        def extract_embeddings(self, image_bytes: bytes) -> list[FaceEmbeddingResult]:
+            self.calls += 1
+            assert image_bytes.startswith(b"\xff\xd8")
+            raise FaceEmbeddingError("No detectable face was found in the provided image.")
+
+    backend = WarmupBackend()
+    monkeypatch.setattr(FaceRecognitionService, "_build_backend", staticmethod(lambda: backend))
+
+    FaceRecognitionService().warmup()
+
+    assert backend.calls == 1
 
 
 def test_recognition_aggregates_multiple_known_person_templates(monkeypatch) -> None:

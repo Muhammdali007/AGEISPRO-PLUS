@@ -3,6 +3,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
+import shutil
+import subprocess
 import tempfile
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
@@ -13,6 +16,8 @@ from time import monotonic
 from uuid import UUID
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -31,6 +36,7 @@ class EventClipEvidence:
 
 
 FrameCapture = Callable[[], Awaitable[tuple[str, str]]]
+MINIMUM_EVENT_CLIP_SECONDS = 5
 
 
 class RingBufferMediaService:
@@ -65,8 +71,15 @@ class RingBufferMediaService:
         before_frames = self._recent_frames(camera_id)
         after_frames = await self._capture_after_frames(camera_id, capture_after_frame)
         frames = [*before_frames, *after_frames]
-        if len(frames) < 2:
+        if not frames:
             return None
+
+        source_frame_count = len(frames)
+        frames, repeated_frame_count = self._resample_clip_frames(
+            frames,
+            duration_seconds=MINIMUM_EVENT_CLIP_SECONDS,
+            fps=settings.event_clip_fps,
+        )
 
         clip_bytes = self._encode_mp4(frames)
         if clip_bytes is None:
@@ -97,9 +110,37 @@ class RingBufferMediaService:
                     "after_seconds": settings.event_clip_after_seconds,
                     "fps": settings.event_clip_fps,
                     "frame_count": len(frames),
+                    "duration_seconds": len(frames) / settings.event_clip_fps,
+                    "minimum_duration_seconds": MINIMUM_EVENT_CLIP_SECONDS,
+                    "source_frame_count": source_frame_count,
+                    "padded_frame_count": repeated_frame_count,
                 }
             },
         )
+
+    @staticmethod
+    def _resample_clip_frames(
+        frames: list[BufferedFrame],
+        *,
+        duration_seconds: int,
+        fps: int,
+    ) -> tuple[list[BufferedFrame], int]:
+        ordered = sorted(frames, key=lambda frame: frame.monotonic_at)
+        target_count = max(2, duration_seconds * fps)
+        end_at = ordered[-1].monotonic_at
+        start_at = end_at - ((target_count - 1) / fps)
+        sampled: list[BufferedFrame] = []
+        source_index = 0
+        for position in range(target_count):
+            target_at = start_at + (position / fps)
+            while (
+                source_index + 1 < len(ordered)
+                and ordered[source_index + 1].monotonic_at <= target_at
+            ):
+                source_index += 1
+            sampled.append(ordered[source_index])
+        distinct_source_frames = len({id(frame) for frame in sampled})
+        return sampled, target_count - distinct_source_frames
 
     def _recent_frames(self, camera_id: UUID | object) -> list[BufferedFrame]:
         now = monotonic()
@@ -139,7 +180,7 @@ class RingBufferMediaService:
 
     def _trim_buffer(self, buffer: deque[BufferedFrame], now: float) -> None:
         window = settings.event_clip_before_seconds + 1
-        max_frames = max(2, window * settings.event_clip_fps * 2)
+        max_frames = max(2, window * max(settings.event_clip_fps * 2, 10))
         while buffer and now - buffer[0].monotonic_at > window:
             buffer.popleft()
         while len(buffer) > max_frames:
@@ -168,21 +209,63 @@ class RingBufferMediaService:
         height, width = decoded[0].shape[:2]
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = Path(temp_dir) / "event.mp4"
-            writer = cv2.VideoWriter(
-                str(output_path),
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                float(settings.event_clip_fps),
-                (width, height),
-            )
-            if not writer.isOpened():
+            ffmpeg = shutil.which("ffmpeg")
+            if not ffmpeg:
+                logger.error("event_clip_encoding_failed reason=ffmpeg_not_installed")
                 return None
+            normalized = [
+                image
+                if image.shape[1] == width and image.shape[0] == height
+                else cv2.resize(image, (width, height))
+                for image in decoded
+            ]
+            command = [
+                ffmpeg,
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pixel_format",
+                "bgr24",
+                "-video_size",
+                f"{width}x{height}",
+                "-framerate",
+                str(settings.event_clip_fps),
+                "-i",
+                "pipe:0",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "baseline",
+                "-level",
+                "3.0",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
             try:
-                for image in decoded:
-                    if image.shape[1] != width or image.shape[0] != height:
-                        image = cv2.resize(image, (width, height))
-                    writer.write(image)
-            finally:
-                writer.release()
+                encoded = subprocess.run(
+                    command,
+                    input=b"".join(image.tobytes() for image in normalized),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    timeout=30,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                logger.exception("event_clip_encoding_failed reason=ffmpeg_execution")
+                return None
+            if encoded.returncode:
+                logger.error(
+                    "event_clip_encoding_failed reason=ffmpeg_exit code=%s stderr=%s",
+                    encoded.returncode,
+                    encoded.stderr.decode("utf-8", errors="replace")[-1000:],
+                )
+                return None
             if not output_path.is_file():
                 return None
             return output_path.read_bytes()

@@ -375,11 +375,16 @@ class DetectionEventService:
     ) -> dict[str, object] | None:
         if not detection.recognition_status:
             return None
+        profile_metadata = detection.metadata or {}
         return {
             "status": detection.recognition_status.value,
             "identity_id": str(detection.identity_id) if detection.identity_id else None,
             "identity_label": detection.identity_label,
             "match_confidence": detection.match_confidence,
+            "person_type": profile_metadata.get("person_type"),
+            "department": profile_metadata.get("department"),
+            "reference_id": profile_metadata.get("reference_id"),
+            "title": profile_metadata.get("title"),
             "face_image_path": detection.face_image_path,
             "face_bounding_box": detection.face_bounding_box.model_dump(exclude_none=True)
             if detection.face_bounding_box

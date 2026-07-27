@@ -1,3 +1,5 @@
+import { useAuthStore } from "@/lib/auth-store";
+
 export type UserRole = "administrator" | "supervisor" | "operator" | "viewer";
 export type CameraSourceType = "usb" | "rtsp" | "http" | "file";
 export type CameraStatus = "online" | "offline" | "degraded" | "disabled" | "unknown";
@@ -187,7 +189,13 @@ export type CameraDetectionScanSummary = {
   confidence: number;
   track_id: string | null;
   recognition_status: string | null;
+  identity_id: string | null;
   identity_label: string | null;
+  match_confidence: number | null;
+  person_type: string | null;
+  department: string | null;
+  reference_id: string | null;
+  title: string | null;
   bounding_box: DetectionOverlayBox | null;
   face_bounding_box: DetectionOverlayBox | null;
   metadata: Record<string, unknown>;
@@ -320,6 +328,46 @@ export type IncidentUpdateInput = Partial<{
   assigned_user_id: string | null;
   metadata: Record<string, unknown>;
 }>;
+
+export type VideoRagQueryInput = {
+  question: string;
+  camera_ids?: string[];
+  start_at?: string | null;
+  end_at?: string | null;
+  limit?: number;
+};
+
+export type VideoRagEvidence = {
+  incident_id: string;
+  camera_id: string;
+  camera_name: string;
+  occurred_at: string;
+  detection_type: DetectionType;
+  confidence: number;
+  matched_excerpt: string;
+  relevance_score: number;
+  clip_start_seconds: number | null;
+  clip_end_seconds: number | null;
+  snapshot_url: string | null;
+  clip_url: string | null;
+};
+
+export type VideoRagFreshness = {
+  latest_indexed_at: string | null;
+  ready: number;
+  queued: number;
+  processing: number;
+  failed: number;
+};
+
+export type VideoRagQueryResponse = {
+  answer: string;
+  evidence: VideoRagEvidence[];
+  warnings: string[];
+  freshness: VideoRagFreshness;
+};
+
+export type VideoRagStatus = VideoRagFreshness & { enabled: boolean };
 
 export type PersonFaceEnrollmentInput = {
   image_path: string;
@@ -529,7 +577,9 @@ export const PERSON_FACE_UPLOAD_MAX_FILE_BYTES = 10 * 1024 * 1024;
 const configuredApiUrl = process.env.NEXT_PUBLIC_API_URL;
 const defaultApiUrl = "http://127.0.0.1:8000";
 const proxyApiUrl = "/backend";
-const apiUnavailableMessage = "API is unavailable. Start the backend on http://127.0.0.1:8000 and try again.";
+const apiUnavailableMessage =
+  "The request could not be completed. The local AI may be busy indexing; wait a moment and try again.";
+let tokenRefreshPromise: Promise<TokenPair | null> | null = null;
 
 function resolveApiUrl() {
   if (typeof window === "undefined") {
@@ -553,19 +603,58 @@ function resolveWebSocketUrl(accessToken: string) {
   return url.toString();
 }
 
-async function apiFetch<T>(path: string, init?: RequestInit & { token?: string }): Promise<T> {
+type ApiRequestInit = RequestInit & {
+  token?: string;
+  errorFallback?: (status: number) => string;
+};
+
+async function apiFetch<T>(path: string, init?: ApiRequestInit): Promise<T> {
   const response = await sendApiRequest(path, init);
   if (response.status === 401 && path !== "/api/v1/auth/refresh" && path !== "/api/v1/auth/login") {
-    const refreshed = await sendApiRequest("/api/v1/auth/refresh", { method: "POST" });
-    if (refreshed.ok) {
-      return parseApiResponse<T>(await sendApiRequest(path, init));
+    const refreshedTokens = await refreshAuthTokens();
+    if (refreshedTokens) {
+      const retryHeaders = new Headers(init?.headers);
+      retryHeaders.delete("Authorization");
+      return parseApiResponse<T>(
+        await sendApiRequest(path, {
+          ...init,
+          headers: retryHeaders,
+          token: refreshedTokens.access_token
+        }),
+        init?.errorFallback
+      );
     }
+    if (typeof window !== "undefined") {
+      useAuthStore.getState().logout();
+    }
+    throw new Error("Session expired. Please sign in again.");
   }
 
-  return parseApiResponse<T>(response);
+  return parseApiResponse<T>(response, init?.errorFallback);
 }
 
-async function sendApiRequest(path: string, init?: RequestInit & { token?: string }): Promise<Response> {
+async function refreshAuthTokens(): Promise<TokenPair | null> {
+  if (!tokenRefreshPromise) {
+    tokenRefreshPromise = (async () => {
+      const response = await sendApiRequest("/api/v1/auth/refresh", { method: "POST" });
+      if (!response.ok) {
+        return null;
+      }
+
+      const tokens = await parseApiResponse<TokenPair>(response);
+      if (typeof window !== "undefined") {
+        useAuthStore.getState().setTokens(tokens);
+      }
+      return tokens;
+    })().finally(() => {
+      tokenRefreshPromise = null;
+    });
+  }
+
+  return tokenRefreshPromise;
+}
+
+async function sendApiRequest(path: string, init?: ApiRequestInit): Promise<Response> {
   const headers = new Headers(init?.headers);
 
   if (!headers.has("Content-Type") && init?.body && !(init.body instanceof FormData)) {
@@ -578,8 +667,9 @@ async function sendApiRequest(path: string, init?: RequestInit & { token?: strin
 
   let response: Response;
   try {
-    const { token, ...requestInit } = init ?? {};
+    const { token, errorFallback, ...requestInit } = init ?? {};
     void token;
+    void errorFallback;
     response = await fetch(`${resolveApiUrl()}${path}`, {
       ...requestInit,
       headers,
@@ -593,9 +683,14 @@ async function sendApiRequest(path: string, init?: RequestInit & { token?: strin
   return response;
 }
 
-async function parseApiResponse<T>(response: Response): Promise<T> {
+async function parseApiResponse<T>(
+  response: Response,
+  errorFallback?: (status: number) => string
+): Promise<T> {
   if (!response.ok) {
-    const fallback = response.status === 401 ? "Session expired" : "Request failed";
+    const fallback =
+      errorFallback?.(response.status) ??
+      (response.status === 401 ? "Session expired" : "Request failed");
     const detail = await readErrorDetail(response, fallback);
     if (detail === fallback && response.status >= 500) {
       throw new Error(apiUnavailableMessage);
@@ -769,10 +864,9 @@ export async function runCameraLiveDetectionScan(
     method: "POST",
     token: accessToken,
     body: JSON.stringify({
-      // Continuous preview frames are transient. Persisting a full snapshot and
-      // face crop on every pass adds large base64/database overhead and delays
-      // the next current-frame result.
-      include_evidence: false,
+      // Preview frames stay transient unless a confirmed detection creates an
+      // incident; that incident retains its snapshot and a five-second clip.
+      include_evidence: true,
       recognition_enabled: true,
       requested_detectors: ["weapon", "person", "fire", "smoke"],
       ...payload
@@ -834,6 +928,18 @@ export async function listIncidents(
   }>
 ) {
   return apiFetch<Incident[]>(withQuery("/api/v1/incidents", filters), { token: accessToken });
+}
+
+export async function queryVideoRag(accessToken: string, payload: VideoRagQueryInput) {
+  return apiFetch<VideoRagQueryResponse>("/api/v1/video-rag/query", {
+    method: "POST",
+    token: accessToken,
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function getVideoRagStatus(accessToken: string) {
+  return apiFetch<VideoRagStatus>("/api/v1/video-rag/status", { token: accessToken });
 }
 
 export async function getIncident(accessToken: string, incidentId: string) {
@@ -1023,34 +1129,17 @@ export async function uploadPersonFaceImages(accessToken: string, personId: stri
   });
   formData.append("is_primary", String(payload.is_primary ?? false));
 
-  const headers = new Headers();
-  if (accessToken !== "cookie") {
-    headers.set("Authorization", `Bearer ${accessToken}`);
-  }
-
-  const response = await fetch(`${resolveApiUrl()}/api/v1/persons/${personId}/faces/upload`, {
+  return apiFetch<Person>(`/api/v1/persons/${personId}/faces/upload`, {
     method: "POST",
-    headers,
-    credentials: "include",
+    token: accessToken,
     body: formData,
-    cache: "no-store"
-  });
-
-  if (!response.ok) {
-    const fallback =
-      response.status === 401
+    errorFallback: (status) =>
+      status === 401
         ? "Session expired"
-        : response.status === 413
+        : status === 413
           ? `Face image upload is too large. Select up to ${PERSON_FACE_UPLOAD_MAX_FILES} images, each ${formatMegabytes(PERSON_FACE_UPLOAD_MAX_FILE_BYTES)} or smaller.`
-          : "Unable to upload face images";
-    const detail = await readErrorDetail(response, fallback);
-    if (detail === fallback && response.status >= 500) {
-      throw new Error(apiUnavailableMessage);
-    }
-    throw new Error(detail);
-  }
-
-  return response.json() as Promise<Person>;
+          : "Unable to upload face images"
+  });
 }
 
 export function validatePersonFaceUpload(payload: PersonFaceUploadInput) {

@@ -12,5 +12,6 @@ from app.models.person import Person  # noqa: F401
 from app.models.person_face_embedding import PersonFaceEmbedding  # noqa: F401
 from app.models.user import User  # noqa: F401
 from app.models.user_session import UserSession  # noqa: F401
+from app.models.video_rag import VideoRagChunk, VideoRagIndex  # noqa: F401
 
 __all__ = ["Base"]

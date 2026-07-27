@@ -6,7 +6,7 @@ from io import BytesIO
 from time import monotonic
 from typing import Iterable
 
-from app.core.config import settings
+from app.core.config import PROJECT_ROOT, settings
 from app.schemas.inference import (
     FaceRegion,
     InferenceBox,
@@ -48,6 +48,39 @@ class FaceRecognitionService:
         self._live_identity_cache: dict[str, list[LiveIdentityState]] = {}
         self._frame_identity_cache: dict[str, list[FrameIdentityState]] = {}
         self._embedding_backend = self._build_backend()
+
+    def warmup(self) -> None:
+        """Initialize the face detector before the first live camera request."""
+        if not hasattr(self._embedding_backend, "extract_embeddings"):
+            return
+
+        from PIL import Image
+
+        warmup_bytes: bytes | None = None
+        faces_root = PROJECT_ROOT / "storage" / "faces"
+        if faces_root.is_dir():
+            for pattern in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
+                candidate = next(faces_root.rglob(pattern), None)
+                if candidate is not None:
+                    try:
+                        warmup_bytes = candidate.read_bytes()
+                    except OSError:
+                        pass
+                    if warmup_bytes:
+                        break
+
+        if warmup_bytes is None:
+            width, height = settings.recognition_insightface_det_size
+            buffer = BytesIO()
+            Image.new("RGB", (width, height), color=(0, 0, 0)).save(buffer, format="JPEG")
+            warmup_bytes = buffer.getvalue()
+        try:
+            # Prefer an enrolled sample when available so both detection and
+            # recognition graphs are initialized. A blank fallback still warms
+            # the detector on a fresh installation with no enrolled people.
+            self._embedding_backend.extract_embeddings(warmup_bytes)
+        except (FaceEmbeddingError, OSError):
+            pass
 
     @staticmethod
     def _build_backend():
@@ -231,7 +264,7 @@ class FaceRecognitionService:
             )
 
         face_only_detections: list[InferenceBox] = []
-        if should_find_unboxed_faces:
+        if should_find_unboxed_faces and face_results:
             for face_index, face_result in enumerate(face_results):
                 if face_index in used_faces:
                     continue

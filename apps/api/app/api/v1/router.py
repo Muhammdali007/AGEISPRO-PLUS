@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1.routes import alerts, auth, cameras, detections, health, incidents, monitoring, persons, users, ws
+from app.api.v1.routes import alerts, auth, cameras, detections, health, incidents, monitoring, persons, users, video_rag, ws
 
 api_router = APIRouter()
 api_router.include_router(health.router, prefix="/health", tags=["health"])
@@ -12,4 +12,5 @@ api_router.include_router(incidents.router, prefix="/incidents", tags=["incident
 api_router.include_router(alerts.router, prefix="/alerts", tags=["alerts"])
 api_router.include_router(detections.router, prefix="/detections", tags=["detections"])
 api_router.include_router(monitoring.router, prefix="/monitoring", tags=["monitoring"])
+api_router.include_router(video_rag.router, prefix="/video-rag", tags=["video-rag"])
 api_router.include_router(ws.router, prefix="/ws", tags=["ws"])

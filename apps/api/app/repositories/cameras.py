@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy.orm import selectinload
@@ -23,7 +23,12 @@ class CameraRepository:
         status: CameraStatus | None = None,
         group: str | None = None,
     ) -> list[Camera]:
-        query = select(Camera).options(selectinload(Camera.secret)).order_by(Camera.created_at.desc())
+        query = (
+            select(Camera)
+            .options(selectinload(Camera.secret))
+            .where(Camera.deleted_at.is_(None))
+            .order_by(Camera.created_at.desc())
+        )
         if status:
             query = query.where(Camera.status == status)
         if group:
@@ -32,7 +37,11 @@ class CameraRepository:
         return list(result)
 
     async def get(self, camera_id: UUID) -> Camera | None:
-        query = select(Camera).options(selectinload(Camera.secret)).where(Camera.id == camera_id)
+        query = (
+            select(Camera)
+            .options(selectinload(Camera.secret))
+            .where(Camera.id == camera_id, Camera.deleted_at.is_(None))
+        )
         return await self.session.scalar(query)
 
     async def create(self, payload: CameraCreate) -> Camera:
@@ -101,7 +110,9 @@ class CameraRepository:
         return camera
 
     async def delete(self, camera: Camera) -> None:
-        await self.session.delete(camera)
+        camera.detection_enabled = False
+        camera.status = CameraStatus.disabled
+        camera.deleted_at = datetime.now(UTC)
         await self.session.flush()
 
     async def get_runtime_source(self, camera: Camera) -> str:

@@ -140,6 +140,7 @@ class UltralyticsInferenceBackend(InferenceBackend):
     def __init__(self) -> None:
         self._models: dict[str, Any] = {}
         self._model_image_sizes: dict[str, int | list[int]] = {}
+        self._model_batch_sizes: dict[str, int] = {}
         self._resolved_device = self._resolve_device()
         self._runtime_stats: dict[str, Any] = {
             "single_requests_total": 0,
@@ -443,7 +444,6 @@ class UltralyticsInferenceBackend(InferenceBackend):
         use_tracking: bool,
     ) -> list[Any]:
         inference_options: dict[str, Any] = {
-            "source": images[0] if use_tracking or len(images) == 1 else images,
             "conf": confidence,
             "classes": requested_classes,
             "device": self._resolved_device,
@@ -454,18 +454,51 @@ class UltralyticsInferenceBackend(InferenceBackend):
         }
         if settings.model_half_precision:
             inference_options["half"] = True
-        if len(images) > 1 and not use_tracking:
-            inference_options["batch"] = min(settings.model_batch_size, len(images))
-            results = model.predict(**inference_options)
-        elif use_tracking:
+        if use_tracking:
             results = model.track(
                 **inference_options,
+                source=images[0],
                 persist=settings.model_track_persist,
                 tracker=settings.model_tracker_config,
             )
-        else:
-            results = model.predict(**inference_options)
-        return self._to_result_list(results)
+            return self._to_result_list(results)
+
+        # OpenVINO exports are commonly static (for example, batch: 1).
+        # Passing several images to such a model makes Ultralytics build an
+        # incompatible NCHW tensor and the entire continuous scan fails.
+        model_batch_size = self._batch_size_for_model(model_path)
+        results: list[Any] = []
+        for offset in range(0, len(images), model_batch_size):
+            image_batch = images[offset : offset + model_batch_size]
+            batch_options = {
+                **inference_options,
+                "source": image_batch[0] if len(image_batch) == 1 else image_batch,
+            }
+            if len(image_batch) > 1:
+                batch_options["batch"] = len(image_batch)
+            results.extend(self._to_result_list(model.predict(**batch_options)))
+        return results
+
+    def _batch_size_for_model(self, weights_path: str) -> int:
+        cached = self._model_batch_sizes.get(weights_path)
+        if cached is not None:
+            return cached
+
+        batch_size = settings.model_batch_size
+        metadata_path = Path(weights_path) / "metadata.yaml"
+        if metadata_path.is_file():
+            try:
+                import yaml
+
+                metadata = yaml.safe_load(metadata_path.read_text(encoding="utf-8")) or {}
+                configured_batch = metadata.get("batch")
+                if isinstance(configured_batch, int) and configured_batch > 0:
+                    batch_size = min(batch_size, configured_batch)
+            except (ImportError, OSError, TypeError, ValueError):
+                batch_size = settings.model_batch_size
+
+        self._model_batch_sizes[weights_path] = max(1, batch_size)
+        return self._model_batch_sizes[weights_path]
 
     def _image_size_for_model(self, weights_path: str) -> int | list[int]:
         cached = self._model_image_sizes.get(weights_path)
@@ -621,9 +654,31 @@ class UltralyticsInferenceBackend(InferenceBackend):
                     # classifying nearly the entire frame as one weapon. A real
                     # localized weapon box cannot plausibly occupy this area.
                     continue
+                if label in {"weapon", "fire", "smoke"} and self._looks_like_edge_strip_false_positive(
+                    coords,
+                    getattr(result, "orig_shape", None),
+                ):
+                    continue
                 threshold = self._confidence_threshold(label)
                 confidence = float(confidences[index]) if index < len(confidences) else threshold
                 if confidence < threshold:
+                    continue
+                if (
+                    label == "weapon"
+                    and object_label in {"weapon", "other_weapon"}
+                    and confidence < settings.model_generic_weapon_min_confidence
+                    and (
+                        not settings.model_weapon_weights_path
+                        or model_path != settings.model_weapon_weights_path
+                    )
+                ):
+                    # A generic detector naming an object only "weapon" needs
+                    # a high confidence floor to avoid scene-level false
+                    # positives. The dedicated weapon model is already gated
+                    # by weapon_confidence_threshold and temporal confirmation;
+                    # applying the generic floor here discarded its valid
+                    # lower-confidence detections before confirmation could
+                    # observe them across frames.
                     continue
 
                 if index < len(track_ids):
@@ -668,7 +723,12 @@ class UltralyticsInferenceBackend(InferenceBackend):
             if detection.label == "weapon" and detection.source_model_path == specialist_path
         ]
         if not specialist_weapons:
-            return [detection for detection in detections if detection.label != "weapon"]
+            return [
+                detection
+                for detection in detections
+                if detection.label != "weapon"
+                or detection.confidence >= settings.model_weapon_general_fallback_confidence
+            ]
 
         return [
             detection
@@ -699,6 +759,37 @@ class UltralyticsInferenceBackend(InferenceBackend):
             return 0.0
         frame_area = frame_width * frame_height
         return (box_width * box_height) / frame_area if frame_area > 0 else 0.0
+
+    @staticmethod
+    def _looks_like_edge_strip_false_positive(coords: list[float], original_shape: Any) -> bool:
+        if not original_shape or len(original_shape) < 2:
+            return False
+        try:
+            frame_height = float(original_shape[0])
+            frame_width = float(original_shape[1])
+            left = float(coords[0])
+            top = float(coords[1])
+            right = float(coords[2])
+            bottom = float(coords[3])
+        except (TypeError, ValueError, IndexError):
+            return False
+
+        box_width = max(0.0, right - left)
+        box_height = max(0.0, bottom - top)
+        if frame_width <= 0 or frame_height <= 0 or box_width <= 0:
+            return False
+
+        aspect_ratio = box_height / box_width
+        touches_vertical_edge = (
+            left <= frame_width * settings.threat_edge_strip_margin_ratio
+            or right >= frame_width * (1 - settings.threat_edge_strip_margin_ratio)
+        )
+        return (
+            touches_vertical_edge
+            and aspect_ratio >= settings.threat_edge_strip_min_aspect_ratio
+            and box_width / frame_width <= settings.threat_edge_strip_max_width_ratio
+            and box_height / frame_height >= settings.threat_edge_strip_min_height_ratio
+        )
 
     @staticmethod
     def _confidence_threshold(label: str) -> float:
@@ -777,13 +868,14 @@ class UltralyticsInferenceBackend(InferenceBackend):
     @staticmethod
     def _limit_frame_detections(detections: list[InferenceBox]) -> list[InferenceBox]:
         kept: list[InferenceBox] = []
-        seen_threats: set[str] = set()
+        threat_counts: dict[str, int] = {}
         other_count = 0
         for detection in detections:
             if detection.label in {"weapon", "fire", "smoke"}:
-                if detection.label in seen_threats:
+                count = threat_counts.get(detection.label, 0)
+                if count >= settings.model_max_threat_detections_per_type:
                     continue
-                seen_threats.add(detection.label)
+                threat_counts[detection.label] = count + 1
             else:
                 if other_count >= 10:
                     continue
@@ -799,6 +891,7 @@ class UltralyticsInferenceBackend(InferenceBackend):
             for detection in detections
             if not (
                 detection.label == "smoke"
+                and detection.confidence < settings.smoke_person_conflict_min_confidence
                 and any(
                     cls._intersection_coverage(detection, person)
                     >= settings.smoke_max_person_coverage

@@ -411,6 +411,52 @@ async def test_camera_scan_reads_usb_camera_without_browser_frame(
 
 
 @pytest.mark.asyncio
+async def test_recorded_video_scans_advance_through_playback(
+    session: AsyncSession,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cameras = CameraRepository(session)
+    service = CameraDetectionService(session)
+    monkeypatch.setattr("app.services.camera_detection.settings.storage_root", tmp_path)
+    monkeypatch.setattr(
+        "app.services.camera_detection.settings.file_video_scan_step_seconds",
+        0.5,
+    )
+    source = tmp_path / "recording.mp4"
+    source.write_bytes(b"fake-video")
+    camera = await cameras.create(
+        CameraCreate(
+            name="Progressing Video",
+            source_type=CameraSourceType.file,
+            source="recording.mp4",
+            inference_fps=5,
+        )
+    )
+    positions: list[float | None] = []
+
+    def capture_frame(source, display_source=None, position_seconds=None):  # type: ignore[no-untyped-def]
+        positions.append(position_seconds)
+        return MediaFrame(
+            content_base64="encoded-frame",
+            content_type="image/jpeg",
+            source_position_seconds=position_seconds,
+            source_duration_seconds=2.0,
+        )
+
+    monkeypatch.setattr(service.media_agent, "capture_opencv_frame", capture_frame)
+    CameraDetectionService._video_file_positions.pop(str(camera.id), None)
+
+    await service._load_frame_from_camera(camera)
+    await service._load_frame_from_camera(camera)
+    await service._load_frame_from_camera(camera)
+    await service._load_frame_from_camera(camera)
+
+    assert positions == [0.0, 0.5, 1.0, 1.5]
+    assert CameraDetectionService._video_file_positions[str(camera.id)][1] == 0.0
+
+
+@pytest.mark.asyncio
 async def test_camera_scan_reads_http_mjpeg_camera_without_browser_frame(
     session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
@@ -456,7 +502,7 @@ async def test_camera_scan_reads_http_mjpeg_camera_without_browser_frame(
 
 
 @pytest.mark.asyncio
-async def test_provisional_weapon_is_hidden_without_creating_incident(
+async def test_provisional_weapon_is_visible_and_creates_incident(
     session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -499,9 +545,69 @@ async def test_provisional_weapon_is_hidden_without_creating_incident(
 
     incidents = await IncidentRepository(session).list()
     assert result.detection_count == 1
-    assert result.detections == []
-    assert result.incident_count == 0
-    assert incidents == []
+    assert len(result.detections) == 1
+    assert result.detections[0].detection_type == "weapon"
+    assert result.detections[0].metadata["provisional"] is True
+    assert result.incident_count == 1
+    assert result.alert_count == 1
+    assert len(incidents) == 1
+    assert incidents[0].detection_type is DetectionType.weapon
+    assert incidents[0].metadata_["detection_metadata"]["provisional"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("detection_type", [DetectionType.fire, DetectionType.smoke])
+async def test_provisional_hazard_types_create_incidents(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    detection_type: DetectionType,
+) -> None:
+    cameras = CameraRepository(session)
+    service = CameraDetectionService(session)
+    camera = await cameras.create(
+        CameraCreate(
+            name=f"{detection_type.value.title()} Cam",
+            source_type=CameraSourceType.http,
+            source="http://camera/live",
+        )
+    )
+
+    async def fake_run_inference(*args, **kwargs):
+        return {
+            "camera_id": str(camera.id),
+            "model_name": "provisional-hazard-test",
+            "model_version": "1",
+            "inference_fps": 5.0,
+            "detections": [
+                {
+                    "x1": 10,
+                    "y1": 20,
+                    "x2": 110,
+                    "y2": 180,
+                    "confidence": 0.18,
+                    "label": detection_type.value,
+                    "track_id": f"{detection_type.value}-candidate",
+                    "provisional": True,
+                }
+            ],
+            "metadata": {"backend": "ultralytics"},
+        }
+
+    monkeypatch.setattr(service, "_run_inference", fake_run_inference)
+    result = await service.run_scan(
+        camera.id,
+        CameraDetectionScanRequest(
+            frame_content_base64="encoded-frame",
+            include_evidence=False,
+            occurrence_hint="dashboard_live_scan",
+        ),
+    )
+
+    incidents = await IncidentRepository(session).list(camera_id=camera.id)
+    assert result.incident_count == 1
+    assert len(incidents) == 1
+    assert incidents[0].detection_type is detection_type
+    assert incidents[0].metadata_["detection_metadata"]["provisional"] is True
 
 
 def test_provisional_fire_remains_visible_for_fast_feedback() -> None:
@@ -576,7 +682,7 @@ async def test_confirmed_live_threat_stores_uploaded_frame_as_snapshot(
     assert len(incidents) == 1
     assert incidents[0].snapshot_path is not None
     assert (tmp_path / incidents[0].snapshot_path).read_bytes() == frame_bytes
-    assert incidents[0].metadata_["snapshot_source"] == "confirmed_dashboard_live_frame"
+    assert incidents[0].metadata_["snapshot_source"] == "confirmed_inference_frame_fallback"
 
 
 @pytest.mark.asyncio
@@ -586,9 +692,8 @@ async def test_continuous_batch_scan_uses_batched_ai_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cameras = CameraRepository(session)
-    service = CameraDetectionService(session)
-
     monkeypatch.setattr("app.services.camera_detection.settings.storage_root", tmp_path)
+    service = CameraDetectionService(session)
     (tmp_path / "frame-1.jpg").write_bytes(b"frame-1")
     (tmp_path / "frame-2.jpg").write_bytes(b"frame-2")
 
@@ -655,6 +760,125 @@ async def test_continuous_batch_scan_uses_batched_ai_request(
     assert all(result.success for result in results)
     assert len(incidents) == 2
     assert len(alerts) == 2
+    assert all(incident.snapshot_path is not None for incident in incidents)
+    assert {
+        (tmp_path / str(incident.snapshot_path)).read_bytes()
+        for incident in incidents
+    } == {b"frame-1", b"frame-2"}
+
+
+@pytest.mark.asyncio
+async def test_confirmed_non_threat_incident_keeps_source_frame_when_ai_omits_evidence(
+    session: AsyncSession,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.services.camera_detection.settings.storage_root", tmp_path)
+    camera = await CameraRepository(session).create(
+        CameraCreate(name="Person Evidence Cam", source_type=CameraSourceType.usb, source="0")
+    )
+    frame_bytes = b"confirmed-person-frame"
+    service = CameraDetectionService(session)
+
+    async def fake_run_inference(*args, **kwargs):
+        return {
+            "camera_id": str(camera.id),
+            "model_name": "person-evidence-test",
+            "model_version": "1",
+            "inference_fps": 5.0,
+            "detections": [
+                {
+                    "x1": 10,
+                    "y1": 20,
+                    "x2": 110,
+                    "y2": 180,
+                    "confidence": 0.82,
+                    "label": "person",
+                    "track_id": "person-confirmed",
+                }
+            ],
+            "metadata": {"backend": "ultralytics"},
+        }
+
+    monkeypatch.setattr(service, "_run_inference", fake_run_inference)
+    result = await service.run_scan(
+        camera.id,
+        CameraDetectionScanRequest(
+            frame_content_base64=base64.b64encode(frame_bytes).decode("utf-8"),
+            frame_content_type="image/jpeg",
+            include_evidence=False,
+            occurrence_hint="dashboard_live_scan",
+        ),
+    )
+
+    incidents = await IncidentRepository(session).list()
+    assert result.incident_count == 1
+    assert len(incidents) == 1
+    assert incidents[0].snapshot_path is not None
+    assert (tmp_path / str(incidents[0].snapshot_path)).read_bytes() == frame_bytes
+
+
+@pytest.mark.asyncio
+async def test_browser_usb_incident_stores_five_second_clip_from_transported_frame(
+    session: AsyncSession,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.services.camera_detection.settings.storage_root", tmp_path)
+    camera = await CameraRepository(session).create(
+        CameraCreate(name="Browser USB Evidence", source_type=CameraSourceType.usb, source="0")
+    )
+    frame_bytes = b"browser-transported-frame"
+    service = CameraDetectionService(session)
+
+    async def fake_run_inference(*args, **kwargs):
+        return {
+            "camera_id": str(camera.id),
+            "model_name": "browser-usb-evidence-test",
+            "model_version": "1",
+            "inference_fps": 5.0,
+            "detections": [
+                {
+                    "x1": 10,
+                    "y1": 20,
+                    "x2": 110,
+                    "y2": 180,
+                    "confidence": 0.82,
+                    "label": "person",
+                    "track_id": "browser-person-confirmed",
+                }
+            ],
+            "metadata": {"backend": "ultralytics"},
+        }
+
+    async def fail_direct_usb_capture(camera):
+        raise RuntimeError("USB device is unavailable inside the API container")
+
+    monkeypatch.setattr(service, "_run_inference", fake_run_inference)
+    monkeypatch.setattr(service, "_load_frame_from_camera", fail_direct_usb_capture)
+    monkeypatch.setattr(
+        "app.services.ring_buffer_media.RingBufferMediaService._encode_mp4",
+        staticmethod(lambda frames: b"five-second-browser-clip"),
+    )
+
+    result = await service.run_scan(
+        camera.id,
+        CameraDetectionScanRequest(
+            frame_content_base64=base64.b64encode(frame_bytes).decode("utf-8"),
+            frame_content_type="image/jpeg",
+            include_evidence=True,
+            occurrence_hint="dashboard_live_scan",
+        ),
+    )
+
+    incidents = await IncidentRepository(session).list(camera_id=camera.id)
+    assert result.incident_count == 1
+    assert len(incidents) == 1
+    assert incidents[0].clip_path is not None
+    assert (tmp_path / str(incidents[0].clip_path)).read_bytes() == b"five-second-browser-clip"
+    event_clip = incidents[0].metadata_["event_clip"]
+    assert event_clip["duration_seconds"] >= 5
+    assert event_clip["minimum_duration_seconds"] == 5
 
 
 @pytest.mark.asyncio
@@ -753,27 +977,45 @@ def test_continuous_worker_claims_only_bounded_batch(monkeypatch: pytest.MonkeyP
 
     claimed = worker._claim_batch()
 
-    assert claimed == ["cam-a", "cam-c"]
+    assert claimed == ["cam-a", "cam-b"]
     assert worker._states["cam-a"].running is True
     assert worker._states["cam-a"].pending_runs == 1
-    assert worker._states["cam-c"].running is True
-    assert worker._states["cam-b"].running is False
+    assert worker._states["cam-b"].running is True
+    assert worker._states["cam-c"].running is False
 
 
-def test_continuous_worker_keeps_hazards_off_the_fast_lane_until_due() -> None:
+def test_continuous_worker_uses_separate_hazard_and_recognition_lanes() -> None:
     worker = ContinuousDetectionWorker()
     worker._states = {
-        "cam-a": CameraJobState(pending_hazards=False),
-        "cam-b": CameraJobState(pending_hazards=True),
+        "cam-a": CameraJobState(pending_hazards=False, pending_recognition=False),
+        "cam-b": CameraJobState(pending_hazards=True, pending_recognition=True),
     }
 
     assert worker._requested_detectors_for_batch(["cam-a"]) == ["weapon", "person"]
-    assert worker._requested_detectors_for_batch(["cam-a", "cam-b"]) == [
-        "weapon",
-        "person",
-        "fire",
-        "smoke",
-    ]
+    assert worker._recognition_enabled_for_batch(["cam-a"]) is False
+    assert worker._requested_detectors_for_batch(["cam-a", "cam-b"]) == ["weapon", "person", "fire", "smoke"]
+    assert worker._recognition_enabled_for_batch(["cam-a", "cam-b"]) is True
+
+
+def test_continuous_worker_does_not_mix_expensive_lane_signatures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.services.continuous_detection.settings.continuous_detection_batch_size", 4)
+    worker = ContinuousDetectionWorker()
+    worker._states = {
+        "fast-a": CameraJobState(pending_runs=1, last_completed_at=1.0),
+        "hazard": CameraJobState(
+            pending_runs=1,
+            pending_hazards=True,
+            last_completed_at=2.0,
+        ),
+        "fast-b": CameraJobState(pending_runs=1, last_completed_at=3.0),
+    }
+
+    claimed = worker._claim_batch()
+
+    assert claimed == ["fast-a", "fast-b"]
+    assert worker._states["hazard"].pending_runs == 1
 
 
 @pytest.mark.parametrize(

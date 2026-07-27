@@ -235,6 +235,40 @@ def test_ultralytics_backend_uses_fixed_openvino_image_size(tmp_path) -> None:
     assert calls[0]["imgsz"] == 320
 
 
+def test_ultralytics_backend_splits_batches_for_static_openvino_model(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model_path = tmp_path / "person_openvino_model"
+    model_path.mkdir()
+    (model_path / "metadata.yaml").write_text(
+        "batch: 1\nimgsz:\n- 640\n- 640\n",
+        encoding="utf-8",
+    )
+    calls: list[dict] = []
+
+    class StaticBatchModel:
+        def predict(self, **kwargs):
+            calls.append(kwargs)
+            assert not isinstance(kwargs["source"], list)
+            assert "batch" not in kwargs
+            return [FakeResult()]
+
+    monkeypatch.setattr("app.services.backends.settings.model_batch_size", 8)
+    backend = UltralyticsInferenceBackend()
+    results = backend._run_model_invocation(
+        model=StaticBatchModel(),
+        model_path=str(model_path),
+        images=[object(), object(), object()],
+        requested_classes=[0],
+        confidence=0.1,
+        use_tracking=False,
+    )
+
+    assert len(calls) == 3
+    assert len(results) == 3
+
+
 def test_ultralytics_backend_normalizes_weapon_detector_aliases(monkeypatch) -> None:
     monkeypatch.setattr("app.services.backends.settings.model_weapon_weights_path", "storage/models/weapon.pt")
     monkeypatch.setattr(
@@ -332,18 +366,194 @@ def test_ambiguous_general_exclusion_does_not_hide_specialist_class(monkeypatch)
     assert detections[0].object_label == "scissors"
 
 
+def test_ultralytics_backend_rejects_tall_edge_strip_threat_false_positive(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.backends.settings.threat_edge_strip_margin_ratio", 0.04)
+    monkeypatch.setattr("app.services.backends.settings.threat_edge_strip_max_width_ratio", 0.18)
+    monkeypatch.setattr("app.services.backends.settings.threat_edge_strip_min_height_ratio", 0.45)
+    monkeypatch.setattr("app.services.backends.settings.threat_edge_strip_min_aspect_ratio", 4.0)
+    backend = UltralyticsInferenceBackend()
+    result = type(
+        "EdgeTreeResult",
+        (),
+        {
+            "names": {0: "smoke"},
+            "orig_shape": (540, 960),
+            "boxes": type(
+                "EdgeTreeBoxes",
+                (),
+                {
+                    "xyxy": FakeTensor([[860, 20, 940, 520]]),
+                    "conf": FakeTensor([0.88]),
+                    "cls": FakeTensor([0]),
+                    "id": None,
+                },
+            )(),
+        },
+    )()
+
+    assert backend._parse_results([result], ["smoke"]) == []
+
+
+def test_ultralytics_backend_rejects_weak_generic_model_weapon_false_positive(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.backends.settings.model_generic_weapon_min_confidence", 0.65)
+    monkeypatch.setattr("app.services.backends.settings.model_weapon_weights_path", "specialist.pt")
+    backend = UltralyticsInferenceBackend()
+    result = type(
+        "FireSceneWeaponResult",
+        (),
+        {
+            "names": {0: "weapon"},
+            "orig_shape": (960, 540),
+            "boxes": type(
+                "FireSceneWeaponBoxes",
+                (),
+                {
+                    "xyxy": FakeTensor([[80, 120, 460, 210]]),
+                    "conf": FakeTensor([0.58]),
+                    "cls": FakeTensor([0]),
+                    "id": None,
+                },
+            )(),
+        },
+    )()
+
+    assert backend._parse_results([result], ["weapon"], model_path="general.pt") == []
+
+
+def test_ultralytics_backend_keeps_specialist_weapon_below_generic_floor(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.backends.settings.model_generic_weapon_min_confidence", 0.65)
+    monkeypatch.setattr("app.services.backends.settings.model_weapon_weights_path", "specialist.pt")
+    backend = UltralyticsInferenceBackend()
+    result = type(
+        "SpecialistWeaponResult",
+        (),
+        {
+            "names": {0: "weapon"},
+            "orig_shape": (720, 1280),
+            "boxes": type(
+                "SpecialistWeaponBoxes",
+                (),
+                {
+                    "xyxy": FakeTensor([[373, 310, 843, 533]]),
+                    "conf": FakeTensor([0.58]),
+                    "cls": FakeTensor([0]),
+                    "id": None,
+                },
+            )(),
+        },
+    )()
+
+    detections = backend._parse_results(
+        [result],
+        ["weapon"],
+        model_path="specialist.pt",
+    )
+
+    assert len(detections) == 1
+    assert detections[0].label == "weapon"
+    assert detections[0].confidence == 0.58
+
+
+def test_ultralytics_backend_rejects_twenty_percent_weapon_false_positive(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.backends.settings.weapon_confidence_threshold", 0.25)
+    monkeypatch.setattr("app.services.backends.settings.model_weapon_weights_path", "specialist.pt")
+    backend = UltralyticsInferenceBackend()
+    result = type(
+        "WeakSpecialistWeaponResult",
+        (),
+        {
+            "names": {0: "weapon"},
+            "orig_shape": (960, 540),
+            "boxes": type(
+                "WeakSpecialistWeaponBoxes",
+                (),
+                {
+                    "xyxy": FakeTensor([[65, 510, 505, 600]]),
+                    "conf": FakeTensor([0.20]),
+                    "cls": FakeTensor([0]),
+                    "id": None,
+                },
+            )(),
+        },
+    )()
+
+    assert backend._parse_results(
+        [result],
+        ["weapon"],
+        model_path="specialist.pt",
+    ) == []
+
+
+def test_ultralytics_backend_keeps_specific_weapon_below_generic_floor(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.backends.settings.model_generic_weapon_min_confidence", 0.65)
+    backend = UltralyticsInferenceBackend()
+    result = type(
+        "SpecificWeaponResult",
+        (),
+        {
+            "names": {0: "pistol"},
+            "orig_shape": (480, 640),
+            "boxes": type(
+                "SpecificWeaponBoxes",
+                (),
+                {
+                    "xyxy": FakeTensor([[100, 100, 180, 180]]),
+                    "conf": FakeTensor([0.42]),
+                    "cls": FakeTensor([0]),
+                    "id": None,
+                },
+            )(),
+        },
+    )()
+
+    detections = backend._parse_results([result], ["weapon"], model_path="general.pt")
+
+    assert len(detections) == 1
+    assert detections[0].object_label == "pistol"
+
+
+def test_ultralytics_backend_keeps_centered_tall_smoke_plume(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.backends.settings.threat_edge_strip_margin_ratio", 0.04)
+    backend = UltralyticsInferenceBackend()
+    result = type(
+        "SmokePlumeResult",
+        (),
+        {
+            "names": {0: "smoke"},
+            "orig_shape": (540, 960),
+            "boxes": type(
+                "SmokePlumeBoxes",
+                (),
+                {
+                    "xyxy": FakeTensor([[430, 20, 510, 520]]),
+                    "conf": FakeTensor([0.88]),
+                    "cls": FakeTensor([0]),
+                    "id": None,
+                },
+            )(),
+        },
+    )()
+
+    detections = backend._parse_results([result], ["smoke"])
+
+    assert len(detections) == 1
+    assert detections[0].label == "smoke"
+
+
 def test_ultralytics_backend_keeps_only_strongest_box_per_threat() -> None:
     detections = [
         InferenceBox(x1=0, y1=0, x2=10, y2=10, confidence=0.91, label="smoke"),
         InferenceBox(x1=20, y1=20, x2=30, y2=30, confidence=0.70, label="smoke"),
+        InferenceBox(x1=40, y1=40, x2=50, y2=50, confidence=0.65, label="smoke"),
+        InferenceBox(x1=60, y1=60, x2=70, y2=70, confidence=0.60, label="smoke"),
         InferenceBox(x1=0, y1=0, x2=10, y2=10, confidence=0.88, label="weapon"),
         InferenceBox(x1=0, y1=0, x2=10, y2=10, confidence=0.95, label="person"),
     ]
 
     limited = UltralyticsInferenceBackend._limit_frame_detections(detections)
 
-    assert [detection.label for detection in limited] == ["smoke", "weapon", "person"]
-    assert next(detection for detection in limited if detection.label == "smoke").confidence == 0.91
+    assert [detection.label for detection in limited] == ["smoke", "smoke", "smoke", "weapon", "person"]
+    assert [detection.confidence for detection in limited if detection.label == "smoke"] == [0.91, 0.70, 0.65]
 
 
 def test_ultralytics_backend_rejects_smoke_contained_inside_person(monkeypatch) -> None:
@@ -364,6 +574,59 @@ def test_ultralytics_backend_keeps_smoke_outside_person(monkeypatch) -> None:
     filtered = UltralyticsInferenceBackend._reject_cross_class_conflicts([person, smoke])
 
     assert filtered == [person, smoke]
+
+
+def test_ultralytics_backend_keeps_confident_smoke_inside_person(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.backends.settings.smoke_max_person_coverage", 0.70)
+    monkeypatch.setattr("app.services.backends.settings.smoke_person_conflict_min_confidence", 0.35)
+    smoke = InferenceBox(x1=20, y1=20, x2=80, y2=80, confidence=0.48, label="smoke")
+    person = InferenceBox(x1=0, y1=0, x2=100, y2=100, confidence=0.90, label="person")
+
+    filtered = UltralyticsInferenceBackend._reject_cross_class_conflicts([person, smoke])
+
+    assert filtered == [person, smoke]
+
+
+def test_general_weapon_fallback_keeps_high_confidence_when_specialist_misses(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.backends.settings.model_weapon_weights_path", "weapon.pt")
+    monkeypatch.setattr("app.services.backends.settings.model_person_weapon_weights_path", "general.pt")
+    monkeypatch.setattr("app.services.backends.settings.model_weapon_ensemble_general", True)
+    monkeypatch.setattr("app.services.backends.settings.model_weapon_general_fallback_confidence", 0.72)
+    general_weapon = InferenceBox(
+        x1=10,
+        y1=20,
+        x2=100,
+        y2=120,
+        confidence=0.78,
+        label="weapon",
+        object_label="knife",
+        source_model_path="general.pt",
+    )
+
+    filtered = UltralyticsInferenceBackend._confirm_specialist_weapon_detections([general_weapon])
+
+    assert filtered == [general_weapon]
+
+
+def test_general_weapon_fallback_rejects_weak_general_hit_when_specialist_misses(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.backends.settings.model_weapon_weights_path", "weapon.pt")
+    monkeypatch.setattr("app.services.backends.settings.model_person_weapon_weights_path", "general.pt")
+    monkeypatch.setattr("app.services.backends.settings.model_weapon_ensemble_general", True)
+    monkeypatch.setattr("app.services.backends.settings.model_weapon_general_fallback_confidence", 0.72)
+    general_weapon = InferenceBox(
+        x1=10,
+        y1=20,
+        x2=100,
+        y2=120,
+        confidence=0.55,
+        label="weapon",
+        object_label="knife",
+        source_model_path="general.pt",
+    )
+
+    filtered = UltralyticsInferenceBackend._confirm_specialist_weapon_detections([general_weapon])
+
+    assert filtered == []
 
 
 def test_ultralytics_backend_ensembles_specialist_and_general_weapon_models(monkeypatch) -> None:

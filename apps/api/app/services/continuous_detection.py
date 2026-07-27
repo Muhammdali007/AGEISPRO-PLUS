@@ -25,7 +25,9 @@ class CameraJobState:
     last_enqueued_at: float = 0.0
     last_completed_at: float = 0.0
     last_hazard_enqueued_at: float = 0.0
+    last_recognition_enqueued_at: float = 0.0
     pending_hazards: bool = False
+    pending_recognition: bool = False
     dropped_runs: int = 0
     failures: int = 0
 
@@ -70,6 +72,7 @@ class ContinuousDetectionWorker:
             "batch_size": settings.continuous_detection_batch_size,
             "max_pending_per_camera": settings.continuous_detection_max_pending_per_camera,
             "hazard_interval_seconds": settings.continuous_detection_hazard_interval_seconds,
+            "recognition_interval_seconds": settings.continuous_detection_recognition_interval_seconds,
         }
 
     async def _schedule_loop(self) -> None:
@@ -134,6 +137,13 @@ class ContinuousDetectionWorker:
             if hazards_due:
                 state.pending_hazards = True
                 state.last_hazard_enqueued_at = now
+            recognition_due = (
+                now - state.last_recognition_enqueued_at
+                >= settings.continuous_detection_recognition_interval_seconds
+            )
+            if recognition_due:
+                state.pending_recognition = True
+                state.last_recognition_enqueued_at = now
             if state.pending_runs < settings.continuous_detection_max_pending_per_camera:
                 state.pending_runs += 1
                 self._wake_event.set()
@@ -153,16 +163,28 @@ class ContinuousDetectionWorker:
         if not ready_items:
             return []
 
+        # Prefer backlogged work, then the camera that has waited longest.
+        # The previous reverse tuple ordering repeatedly favored the most
+        # recently completed camera and could starve a slower feed.
         ready_items.sort(
-            key=lambda item: (item[1].pending_runs, item[1].last_completed_at),
-            reverse=True,
+            key=lambda item: (-item[1].pending_runs, item[1].last_completed_at),
         )
+        lead_signature = self._lane_signature(ready_items[0][1])
         claimed: list[object] = []
-        for camera_id, state in ready_items[: settings.continuous_detection_batch_size]:
+        for camera_id, state in ready_items:
+            if self._lane_signature(state) != lead_signature:
+                continue
             state.pending_runs -= 1
             state.running = True
             claimed.append(self._parse_camera_id(camera_id))
+            if len(claimed) >= settings.continuous_detection_batch_size:
+                break
         return claimed
+
+    @staticmethod
+    def _lane_signature(state: CameraJobState) -> tuple[bool, bool]:
+        """Batch only cameras requiring the same expensive specialist lanes."""
+        return state.pending_hazards, state.pending_recognition
 
     @staticmethod
     def _parse_camera_id(camera_id: str) -> object:
@@ -173,10 +195,12 @@ class ContinuousDetectionWorker:
 
     async def _run_batch(self, batch_camera_ids: list[object]) -> None:
         requested_detectors = self._requested_detectors_for_batch(batch_camera_ids)
+        recognition_enabled = self._recognition_enabled_for_batch(batch_camera_ids)
         for camera_id in batch_camera_ids:
             state = self._states.get(str(camera_id))
             if state is not None:
                 state.pending_hazards = False
+                state.pending_recognition = False
 
         async with AsyncSessionLocal() as session:
             results = await CameraDetectionService(session).run_continuous_batch(
@@ -184,7 +208,7 @@ class ContinuousDetectionWorker:
                 CameraDetectionScanRequest(
                     include_evidence=True,
                     requested_detectors=requested_detectors,
-                    recognition_enabled=True,
+                    recognition_enabled=recognition_enabled,
                     occurrence_hint="continuous_monitoring",
                 ),
             )
@@ -198,6 +222,12 @@ class ContinuousDetectionWorker:
         ):
             requested.extend(["fire", "smoke"])
         return requested
+
+    def _recognition_enabled_for_batch(self, batch_camera_ids: list[object]) -> bool:
+        return any(
+            self._states.get(str(camera_id), CameraJobState()).pending_recognition
+            for camera_id in batch_camera_ids
+        )
 
     def _mark_batch_complete(
         self,

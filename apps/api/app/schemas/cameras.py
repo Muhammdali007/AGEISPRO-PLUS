@@ -145,7 +145,13 @@ class CameraDetectionScanSummary(BaseModel):
     confidence: float
     track_id: str | None = None
     recognition_status: str | None = None
+    identity_id: UUID | None = None
     identity_label: str | None = None
+    match_confidence: float | None = Field(default=None, ge=0, le=1)
+    person_type: str | None = None
+    department: str | None = None
+    reference_id: str | None = None
+    title: str | None = None
     bounding_box: DetectionBoundingBox | None = None
     face_bounding_box: DetectionBoundingBox | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
