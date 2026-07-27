@@ -9,6 +9,8 @@ __pycache__/
 .ruff_cache/
 *.pyc
 node_modules/
+tools/node-v*-win-x64/
+tools/node-v*-win-x64.zip
 .next/
 dist/
 coverage/
