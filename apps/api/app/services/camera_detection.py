@@ -358,14 +358,18 @@ class CameraDetectionService:
                     position_seconds=position,
                 )
 
-            step = max(
+            # Treat the configured file-video step as the largest acceptable
+            # gap between analyzed playback positions. A camera configured for
+            # a higher inference FPS should sample the recording more densely
+            # instead of remaining capped at two frames per video second.
+            step = min(
                 settings.file_video_scan_step_seconds,
                 1.0 / max(1, camera.inference_fps),
             )
             next_position = position + step
             if (
                 frame.source_duration_seconds is not None
-                and next_position >= frame.source_duration_seconds
+                and next_position >= max(0.0, frame.source_duration_seconds - 1e-6)
             ):
                 next_position = 0.0
             self._video_file_positions[key] = (signature, next_position)
@@ -755,11 +759,10 @@ class CameraDetectionService:
     @staticmethod
     def _summarize_detections(detections: list[dict]) -> list[CameraDetectionScanSummary]:
         summaries: list[CameraDetectionScanSummary] = []
-        for detection in detections:
-            if CameraDetectionService._hide_from_operator_overlay(detection):
-                continue
+        for detection in CameraDetectionService._consolidate_hazard_overlays(detections):
             recognition = detection.get("recognition") or {}
             recognition_metadata = recognition.get("metadata") or {}
+            combined_hazard_labels = detection.get("combined_hazard_labels")
             summaries.append(
                 CameraDetectionScanSummary(
                     detection_type=str(detection.get("label", "unknown")),
@@ -785,14 +788,252 @@ class CameraDetectionService:
                     metadata={
                         **recognition_metadata,
                         "provisional": bool(detection.get("provisional", False)),
+                        **(
+                            {"combined_hazard_labels": combined_hazard_labels}
+                            if combined_hazard_labels
+                            else {}
+                        ),
                     },
                 )
             )
         return summaries
 
     @staticmethod
-    def _hide_from_operator_overlay(detection: dict) -> bool:
-        return False
+    def _consolidate_hazard_overlays(detections: list[dict]) -> list[dict]:
+        """Render one enclosing box per hazard type and affected region.
+
+        The original detections still feed incident creation. This only
+        consolidates predictions for the operator overlay. Fragmented,
+        provisional flame boxes can borrow a nearby smoke region to cover the
+        complete burning area, while isolated weak fire specks are discarded.
+        """
+        hazards = [
+            dict(detection)
+            for detection in detections
+            if str(detection.get("label", "")).lower() in {"fire", "smoke"}
+        ]
+        others = [
+            detection
+            for detection in detections
+            if str(detection.get("label", "")).lower() not in {"fire", "smoke"}
+        ]
+        if len(hazards) < 2:
+            return list(detections)
+
+        credible_fires = [
+            detection
+            for detection in hazards
+            if str(detection.get("label", "")).lower() == "fire"
+            and float(detection.get("confidence", 0)) >= 0.10
+        ]
+        if credible_fires:
+            hazards = [
+                detection
+                for detection in hazards
+                if (
+                    str(detection.get("label", "")).lower() != "fire"
+                    or float(detection.get("confidence", 0)) >= 0.10
+                    or any(
+                        CameraDetectionService._hazard_boxes_belong_together(
+                            detection,
+                            credible_fire,
+                        )
+                        for credible_fire in credible_fires
+                    )
+                )
+            ]
+
+        clusters: list[list[dict]] = []
+        for hazard in hazards:
+            matching_indices = [
+                index
+                for index, cluster in enumerate(clusters)
+                if any(
+                    CameraDetectionService._hazard_boxes_belong_together(hazard, member)
+                    for member in cluster
+                )
+            ]
+            if not matching_indices:
+                clusters.append([hazard])
+                continue
+
+            primary_index = matching_indices[0]
+            clusters[primary_index].append(hazard)
+            for merge_index in reversed(matching_indices[1:]):
+                clusters[primary_index].extend(clusters.pop(merge_index))
+
+        consolidated: list[dict] = []
+        for cluster in clusters:
+            if len(cluster) == 1:
+                consolidated.append(cluster[0])
+                continue
+
+            representative = max(
+                cluster,
+                key=lambda detection: float(detection.get("confidence", 0)),
+            )
+            labels = sorted(
+                {
+                    str(detection.get("label", "")).lower()
+                    for detection in cluster
+                    if detection.get("label")
+                }
+            )
+            combined = dict(representative)
+            combined.update(
+                {
+                    "x1": min(float(detection.get("x1", 0)) for detection in cluster),
+                    "y1": min(float(detection.get("y1", 0)) for detection in cluster),
+                    "x2": max(float(detection.get("x2", 0)) for detection in cluster),
+                    "y2": max(float(detection.get("y2", 0)) for detection in cluster),
+                }
+            )
+            combined["confidence"] = max(
+                float(detection.get("confidence", 0)) for detection in cluster
+            )
+            combined["provisional"] = all(
+                bool(detection.get("provisional", False)) for detection in cluster
+            )
+            combined["combined_hazard_labels"] = labels
+            combined["_overlay_cluster_size"] = len(cluster)
+            consolidated.append(combined)
+
+        fire_overlays = [
+            detection
+            for detection in consolidated
+            if str(detection.get("label", "")).lower() == "fire"
+        ]
+        smoke_overlays = [
+            detection
+            for detection in consolidated
+            if str(detection.get("label", "")).lower() == "smoke"
+        ]
+        used_smoke_ids: set[int] = set()
+        expanded_fires: list[dict] = []
+        for fire in fire_overlays:
+            cluster_size = int(fire.get("_overlay_cluster_size", 1))
+            should_expand = (
+                bool(fire.get("provisional", False))
+                and cluster_size >= 2
+                and float(fire.get("confidence", 0)) < 0.30
+            )
+            context_candidates = [
+                (CameraDetectionService._fire_smoke_context_score(fire, smoke), smoke)
+                for smoke in smoke_overlays
+                if id(smoke) not in used_smoke_ids
+            ]
+            context_candidates = [
+                (score, smoke)
+                for score, smoke in context_candidates
+                if score is not None
+            ]
+            if should_expand and context_candidates:
+                _, smoke = max(context_candidates, key=lambda item: item[0])
+                used_smoke_ids.add(id(smoke))
+                expanded = dict(fire)
+                expanded.update(
+                    {
+                        "x1": min(float(fire.get("x1", 0)), float(smoke.get("x1", 0))),
+                        "y1": min(float(fire.get("y1", 0)), float(smoke.get("y1", 0))),
+                        "x2": max(float(fire.get("x2", 0)), float(smoke.get("x2", 0))),
+                        "y2": max(float(fire.get("y2", 0)), float(smoke.get("y2", 0))),
+                        "combined_hazard_labels": ["fire", "smoke"],
+                        "fire_context_expanded": True,
+                    }
+                )
+                fire = expanded
+            fire.pop("_overlay_cluster_size", None)
+            expanded_fires.append(fire)
+
+        remaining_hazards = [
+            detection
+            for detection in consolidated
+            if str(detection.get("label", "")).lower() not in {"fire", "smoke"}
+        ]
+        remaining_smoke = [
+            detection
+            for detection in smoke_overlays
+            if id(detection) not in used_smoke_ids
+            and (
+                not used_smoke_ids
+                or float(detection.get("confidence", 0)) >= 0.10
+            )
+        ]
+        for detection in remaining_hazards + remaining_smoke:
+            detection.pop("_overlay_cluster_size", None)
+        return others + remaining_hazards + remaining_smoke + expanded_fires
+
+    @staticmethod
+    def _hazard_boxes_belong_together(first: dict, second: dict) -> bool:
+        if str(first.get("label", "")).lower() != str(second.get("label", "")).lower():
+            return False
+        left = max(float(first.get("x1", 0)), float(second.get("x1", 0)))
+        top = max(float(first.get("y1", 0)), float(second.get("y1", 0)))
+        right = min(float(first.get("x2", 0)), float(second.get("x2", 0)))
+        bottom = min(float(first.get("y2", 0)), float(second.get("y2", 0)))
+        intersection = max(0.0, right - left) * max(0.0, bottom - top)
+        smaller_area = min(
+            CameraDetectionService._box_area(first),
+            CameraDetectionService._box_area(second),
+        )
+        if smaller_area > 0 and intersection / smaller_area >= 0.25:
+            return True
+
+        if (
+            str(first.get("label", "")).lower() != "fire"
+            or not bool(first.get("provisional", False))
+            or not bool(second.get("provisional", False))
+        ):
+            return False
+        horizontal_gap = max(
+            0.0,
+            max(float(first.get("x1", 0)), float(second.get("x1", 0)))
+            - min(float(first.get("x2", 0)), float(second.get("x2", 0))),
+        )
+        vertical_gap = max(
+            0.0,
+            max(float(first.get("y1", 0)), float(second.get("y1", 0)))
+            - min(float(first.get("y2", 0)), float(second.get("y2", 0))),
+        )
+        max_width = max(
+            float(first.get("x2", 0)) - float(first.get("x1", 0)),
+            float(second.get("x2", 0)) - float(second.get("x1", 0)),
+        )
+        max_height = max(
+            float(first.get("y2", 0)) - float(first.get("y1", 0)),
+            float(second.get("y2", 0)) - float(second.get("y1", 0)),
+        )
+        return (
+            horizontal_gap <= max(16.0, max_width * 0.50)
+            and vertical_gap <= max(16.0, max_height * 0.50)
+        )
+
+    @staticmethod
+    def _fire_smoke_context_score(fire: dict, smoke: dict) -> float | None:
+        fire_width = max(0.0, float(fire.get("x2", 0)) - float(fire.get("x1", 0)))
+        fire_height = max(0.0, float(fire.get("y2", 0)) - float(fire.get("y1", 0)))
+        fire_diagonal = math.hypot(fire_width, fire_height)
+        if fire_diagonal <= 0:
+            return None
+
+        fire_center_x = (float(fire.get("x1", 0)) + float(fire.get("x2", 0))) / 2
+        fire_center_y = (float(fire.get("y1", 0)) + float(fire.get("y2", 0))) / 2
+        smoke_center_x = (float(smoke.get("x1", 0)) + float(smoke.get("x2", 0))) / 2
+        smoke_center_y = (float(smoke.get("y1", 0)) + float(smoke.get("y2", 0))) / 2
+        normalized_distance = (
+            math.hypot(fire_center_x - smoke_center_x, fire_center_y - smoke_center_y)
+            / fire_diagonal
+        )
+        if normalized_distance > 3.0:
+            return None
+        return float(smoke.get("confidence", 0)) - normalized_distance * 0.01
+
+    @staticmethod
+    def _box_area(detection: dict) -> float:
+        return max(0.0, float(detection.get("x2", 0)) - float(detection.get("x1", 0))) * max(
+            0.0,
+            float(detection.get("y2", 0)) - float(detection.get("y1", 0)),
+        )
 
     @staticmethod
     def _guess_content_type(extension: str) -> str:

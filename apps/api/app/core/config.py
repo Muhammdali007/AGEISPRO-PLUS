@@ -302,7 +302,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("API_EVENT_CLIP_AFTER_SECONDS"),
     )
     event_clip_fps: int = Field(
-        default=10,
+        default=24,
         ge=1,
         le=30,
         validation_alias=AliasChoices("API_EVENT_CLIP_FPS"),

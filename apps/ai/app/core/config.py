@@ -259,7 +259,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("AI_THREAT_EDGE_STRIP_MIN_ASPECT_RATIO"),
     )
     recognition_match_threshold: float = Field(
-        default=0.50,
+        default=0.47,
         ge=0,
         le=1,
         validation_alias=AliasChoices("AI_RECOGNITION_MATCH_THRESHOLD"),
@@ -353,7 +353,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("AI_WEAPON_CONFIRMATION_FRAMES"),
     )
     fire_confirmation_frames: int = Field(
-        default=2,
+        default=3,
         ge=1,
         le=10,
         validation_alias=AliasChoices("AI_FIRE_CONFIRMATION_FRAMES"),

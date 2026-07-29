@@ -420,7 +420,9 @@ def test_ultralytics_backend_rejects_weak_generic_model_weapon_false_positive(mo
     assert backend._parse_results([result], ["weapon"], model_path="general.pt") == []
 
 
-def test_ultralytics_backend_keeps_specialist_weapon_below_generic_floor(monkeypatch) -> None:
+def test_ultralytics_backend_rejects_ambiguous_specialist_weapon_below_generic_floor(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr("app.services.backends.settings.model_generic_weapon_min_confidence", 0.65)
     monkeypatch.setattr("app.services.backends.settings.model_weapon_weights_path", "specialist.pt")
     backend = UltralyticsInferenceBackend()
@@ -449,9 +451,7 @@ def test_ultralytics_backend_keeps_specialist_weapon_below_generic_floor(monkeyp
         model_path="specialist.pt",
     )
 
-    assert len(detections) == 1
-    assert detections[0].label == "weapon"
-    assert detections[0].confidence == 0.58
+    assert detections == []
 
 
 def test_ultralytics_backend_rejects_twenty_percent_weapon_false_positive(monkeypatch) -> None:

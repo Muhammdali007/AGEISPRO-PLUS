@@ -209,16 +209,21 @@ class RingBufferMediaService:
         height, width = decoded[0].shape[:2]
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = Path(temp_dir) / "event.mp4"
-            ffmpeg = shutil.which("ffmpeg")
-            if not ffmpeg:
-                logger.error("event_clip_encoding_failed reason=ffmpeg_not_installed")
-                return None
             normalized = [
                 image
                 if image.shape[1] == width and image.shape[0] == height
                 else cv2.resize(image, (width, height))
                 for image in decoded
             ]
+            ffmpeg = shutil.which("ffmpeg")
+            if not ffmpeg:
+                logger.warning(
+                    "event_clip_external_encoder_unavailable fallback=opencv_video_writer"
+                )
+                return RingBufferMediaService._encode_mp4_with_opencv(
+                    normalized,
+                    output_path,
+                )
             command = [
                 ffmpeg,
                 "-y",
@@ -258,17 +263,67 @@ class RingBufferMediaService:
                 )
             except (OSError, subprocess.TimeoutExpired):
                 logger.exception("event_clip_encoding_failed reason=ffmpeg_execution")
-                return None
+                return RingBufferMediaService._encode_mp4_with_opencv(
+                    normalized,
+                    output_path,
+                )
             if encoded.returncode:
                 logger.error(
-                    "event_clip_encoding_failed reason=ffmpeg_exit code=%s stderr=%s",
+                    "event_clip_external_encoder_failed fallback=opencv_video_writer "
+                    "code=%s stderr=%s",
                     encoded.returncode,
                     encoded.stderr.decode("utf-8", errors="replace")[-1000:],
                 )
-                return None
+                return RingBufferMediaService._encode_mp4_with_opencv(
+                    normalized,
+                    output_path,
+                )
             if not output_path.is_file():
-                return None
+                logger.error(
+                    "event_clip_external_encoder_failed fallback=opencv_video_writer "
+                    "reason=missing_output"
+                )
+                return RingBufferMediaService._encode_mp4_with_opencv(
+                    normalized,
+                    output_path,
+                )
             return output_path.read_bytes()
+
+    @staticmethod
+    def _encode_mp4_with_opencv(images: list[object], output_path: Path) -> bytes | None:
+        import cv2
+
+        height, width = images[0].shape[:2]
+        writer = None
+        selected_codec = None
+        for codec in ("avc1", "mp4v"):
+            candidate = cv2.VideoWriter(
+                str(output_path),
+                cv2.VideoWriter_fourcc(*codec),
+                settings.event_clip_fps,
+                (width, height),
+            )
+            if candidate.isOpened():
+                writer = candidate
+                selected_codec = codec
+                break
+            candidate.release()
+
+        if writer is None:
+            logger.error("event_clip_encoding_failed reason=opencv_video_writer_unavailable")
+            return None
+
+        try:
+            for image in images:
+                writer.write(image)
+        finally:
+            writer.release()
+
+        if not output_path.is_file() or output_path.stat().st_size == 0:
+            logger.error("event_clip_encoding_failed reason=opencv_video_writer_empty_output")
+            return None
+        logger.info("event_clip_encoded encoder=opencv codec=%s", selected_codec)
+        return output_path.read_bytes()
 
 
 ring_buffer_media_service = RingBufferMediaService()

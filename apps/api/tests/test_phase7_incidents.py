@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import sys
+from types import SimpleNamespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -205,6 +207,39 @@ def test_ring_buffer_resamples_real_preview_motion_across_five_seconds() -> None
     assert sampled[0].content_base64 == "frame-0"
     assert sampled[-1].content_base64 == "frame-4"
     assert repeated == 5
+
+
+def test_opencv_fallback_encodes_mp4_without_external_ffmpeg(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_path = tmp_path / "fallback.mp4"
+
+    class FakeWriter:
+        def __init__(self, path: str, *_args) -> None:
+            self.path = Path(path)
+            self.frames: list[object] = []
+
+        def isOpened(self) -> bool:
+            return True
+
+        def write(self, image: object) -> None:
+            self.frames.append(image)
+
+        def release(self) -> None:
+            self.path.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"frame" * len(self.frames))
+
+    fake_cv2 = SimpleNamespace(
+        VideoWriter=FakeWriter,
+        VideoWriter_fourcc=lambda *_codec: 1,
+    )
+    monkeypatch.setitem(sys.modules, "cv2", fake_cv2)
+    images = [SimpleNamespace(shape=(32, 32, 3)) for _ in range(3)]
+
+    clip = RingBufferMediaService._encode_mp4_with_opencv(images, output_path)
+
+    assert clip is not None
+    assert b"ftyp" in clip[:64]
 
 
 @pytest.mark.asyncio

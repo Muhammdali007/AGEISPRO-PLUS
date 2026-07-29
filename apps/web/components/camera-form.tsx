@@ -9,6 +9,7 @@ import { Button } from "@/components/button";
 
 export const cameraSourceTypes = ["usb", "rtsp", "http", "file"] as const satisfies readonly CameraSourceType[];
 export const registrationRoles = ["administrator", "supervisor", "operator", "viewer"] as const satisfies readonly UserRole[];
+const RECORDED_VIDEO_DEFAULT_INFERENCE_FPS = 10;
 
 export type CameraFormValues = {
   name: string;
@@ -85,6 +86,16 @@ export function CameraForm({
           {...sourceTypeRegistration}
           onChange={(event) => {
             void sourceTypeRegistration.onChange(event);
+            if (event.currentTarget.value === "file") {
+              form.setValue(
+                "inference_fps",
+                Math.max(
+                  form.getValues("inference_fps") || 0,
+                  RECORDED_VIDEO_DEFAULT_INFERENCE_FPS
+                ),
+                { shouldDirty: true, shouldValidate: true }
+              );
+            }
             form.setValue("source", "", { shouldDirty: true, shouldValidate: false });
             onFileSelected?.(null);
           }}
@@ -122,7 +133,15 @@ export function CameraForm({
         )}
       </FormField>
 
-      <FormField label="Inference FPS" error={form.formState.errors.inference_fps?.message}>
+      <FormField
+        label="Inference FPS"
+        error={form.formState.errors.inference_fps?.message}
+        hint={
+          selectedSourceType === "file"
+            ? "Recorded videos default to 10 FPS so short-lived hazards are analyzed more densely."
+            : undefined
+        }
+      >
         <input
           className="h-11 w-full rounded-md border border-border bg-background px-3 text-sm outline-none transition focus:border-accent"
           type="number"

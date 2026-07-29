@@ -667,18 +667,14 @@ class UltralyticsInferenceBackend(InferenceBackend):
                     label == "weapon"
                     and object_label in {"weapon", "other_weapon"}
                     and confidence < settings.model_generic_weapon_min_confidence
-                    and (
-                        not settings.model_weapon_weights_path
-                        or model_path != settings.model_weapon_weights_path
-                    )
                 ):
-                    # A generic detector naming an object only "weapon" needs
-                    # a high confidence floor to avoid scene-level false
-                    # positives. The dedicated weapon model is already gated
-                    # by weapon_confidence_threshold and temporal confirmation;
-                    # applying the generic floor here discarded its valid
-                    # lower-confidence detections before confirmation could
-                    # observe them across frames.
+                    # "Weapon" and "other_weapon" are ambiguous catch-all
+                    # classes. Apply the stricter floor even to the specialist
+                    # model: weak scene textures such as flames, roof lines,
+                    # benches, and railings otherwise become operator-visible
+                    # weapon boxes before temporal confirmation settles.
+                    # Specific classes such as pistol or knife continue to use
+                    # the calibrated weapon threshold.
                     continue
 
                 if index < len(track_ids):

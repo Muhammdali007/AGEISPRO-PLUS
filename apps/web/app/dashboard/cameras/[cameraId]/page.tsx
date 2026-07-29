@@ -20,7 +20,7 @@ const LIVE_DETECTION_EMPTY_GRACE_MS = 2500;
 const LIVE_WEAPON_SCAN_INTERVAL_MS = 500;
 const LIVE_HAZARD_SCAN_INTERVAL_MS = 500;
 const LIVE_RECOGNITION_SCAN_INTERVAL_MS = 2000;
-const LIVE_KNOWN_IDENTITY_HOLD_MS = 3500;
+const LIVE_KNOWN_IDENTITY_HOLD_MS = 8000;
 const LIVE_PERSON_DETECTION_TYPES = new Set(["person", "known_person", "unknown_person"]);
 const LIVE_RECOGNITION_OBSERVED_AT_KEY = "client_recognition_observed_at_ms";
 
@@ -71,11 +71,7 @@ function retainPersonIdentity(
   current: CameraDetectionScanSummary,
   previousPeople: CameraDetectionScanSummary[]
 ) {
-  if (
-    current.detection_type !== "person"
-    || current.recognition_status
-    || current.identity_label
-  ) {
+  if (current.recognition_status === "known") {
     return current;
   }
 
@@ -96,12 +92,42 @@ function retainPersonIdentity(
   if (!previousIdentity) {
     return current;
   }
+  const previousIsKnown = previousIdentity.recognition_status === "known";
+  const candidateIdentityId = typeof current.metadata.candidate_identity_id === "string"
+    ? current.metadata.candidate_identity_id
+    : "";
+  const recognitionError = typeof current.metadata.recognition_error === "string"
+    ? current.metadata.recognition_error
+    : "";
+  const isUnrecognizedPersonPass =
+    current.detection_type === "person"
+    && !current.recognition_status
+    && !current.identity_label;
+  const isSameKnownCandidate =
+    current.recognition_status === "unknown"
+    && previousIsKnown
+    && Boolean(previousIdentity.identity_id)
+    && candidateIdentityId === previousIdentity.identity_id;
+  const isTemporaryFaceMiss =
+    current.recognition_status === "unknown"
+    && previousIsKnown
+    && recognitionError.toLowerCase().includes("no face");
+
+  if (!isUnrecognizedPersonPass && !isSameKnownCandidate && !isTemporaryFaceMiss) {
+    return current;
+  }
 
   return {
     ...current,
     detection_type: previousIdentity.detection_type,
     recognition_status: previousIdentity.recognition_status,
+    identity_id: previousIdentity.identity_id,
     identity_label: previousIdentity.identity_label,
+    match_confidence: previousIdentity.match_confidence,
+    person_type: previousIdentity.person_type,
+    department: previousIdentity.department,
+    reference_id: previousIdentity.reference_id,
+    title: previousIdentity.title,
     face_bounding_box: projectFaceBox(
       previousIdentity.face_bounding_box,
       previousIdentity.bounding_box,
@@ -361,6 +387,9 @@ export default function CameraDetailPage() {
     stream?.stream_kind === "browser-camera"
     || (camera?.source_type === "file" && stream?.stream_kind !== "image")
   );
+  const isRecordedVideo = Boolean(
+    camera?.source_type === "file" && stream?.stream_kind !== "image"
+  );
   // Browser-camera and recorded-file detections belong to the exact preview
   // frame just submitted. Do not paint persisted boxes from another frame over
   // moving media.
@@ -413,7 +442,11 @@ export default function CameraDetailPage() {
     // A browser camera cannot queue frames like a media worker. Start the next
     // scan only after the previous one completes and discard intermediate
     // frames. This keeps inference latency from turning into video latency.
-    const intervalMs = Math.max(200, Math.round(1000 / Math.max(1, liveScanInferenceFps)));
+    const minimumIntervalMs = isRecordedVideo ? 100 : 200;
+    const intervalMs = Math.max(
+      minimumIntervalMs,
+      Math.round(1000 / Math.max(1, liveScanInferenceFps))
+    );
     let nextScan: number | undefined;
     // The first readable preview frame must run every safety detector. Delaying
     // the hazard lane here made a newly visible fire/smoke/weapon wait before
@@ -502,9 +535,18 @@ export default function CameraDetailPage() {
       });
       try {
         const scanClock = performance.now();
-        const weaponScanDue = scanClock - lastLiveWeaponScanRef.current >= LIVE_WEAPON_SCAN_INTERVAL_MS;
-        const hazardScanDue = scanClock - lastLiveHazardScanRef.current >= LIVE_HAZARD_SCAN_INTERVAL_MS;
-        const recognitionScanDue = scanClock - lastLiveRecognitionScanRef.current >= LIVE_RECOGNITION_SCAN_INTERVAL_MS;
+        // Recorded footage is finite and may contain a hazard for only a few
+        // frames, so run the complete AI suite on every analyzed video frame.
+        // Live sources retain the lower-cost specialist cadence.
+        const weaponScanDue =
+          isRecordedVideo
+          || scanClock - lastLiveWeaponScanRef.current >= LIVE_WEAPON_SCAN_INTERVAL_MS;
+        const hazardScanDue =
+          isRecordedVideo
+          || scanClock - lastLiveHazardScanRef.current >= LIVE_HAZARD_SCAN_INTERVAL_MS;
+        const recognitionScanDue =
+          isRecordedVideo
+          || scanClock - lastLiveRecognitionScanRef.current >= LIVE_RECOGNITION_SCAN_INTERVAL_MS;
         const requestedDetectors = [
           "person",
           ...(weaponScanDue ? ["weapon"] : []),
@@ -597,7 +639,16 @@ export default function CameraDetailPage() {
       cancelOverlayExpiry();
       setCurrentLiveDetections(null);
     };
-  }, [accessToken, isLiveScanActive, liveScanInferenceFps, logout, params.cameraId, queryClient, router]);
+  }, [
+    accessToken,
+    isLiveScanActive,
+    isRecordedVideo,
+    liveScanInferenceFps,
+    logout,
+    params.cameraId,
+    queryClient,
+    router
+  ]);
 
   async function handleDeleteCamera() {
     if (!window.confirm("Delete this camera? This action cannot be undone.")) {

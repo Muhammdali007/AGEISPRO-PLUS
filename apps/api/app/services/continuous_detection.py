@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 @dataclass(slots=True)
 class CameraJobState:
     inference_fps: int = 1
+    recorded_file: bool = False
     pending_runs: int = 0
     running: bool = False
     last_enqueued_at: float = 0.0
@@ -126,13 +127,17 @@ class ContinuousDetectionWorker:
             eligible_camera_ids.add(key)
             state = self._states.setdefault(key, CameraJobState())
             state.inference_fps = max(1, camera.inference_fps)
+            state.recorded_file = camera.source_type == CameraSourceType.file
             if now - state.last_enqueued_at < 1.0 / state.inference_fps:
                 continue
 
             state.last_enqueued_at = now
             hazards_due = (
-                now - state.last_hazard_enqueued_at
-                >= settings.continuous_detection_hazard_interval_seconds
+                state.recorded_file
+                or (
+                    now - state.last_hazard_enqueued_at
+                    >= settings.continuous_detection_hazard_interval_seconds
+                )
             )
             if hazards_due:
                 state.pending_hazards = True
@@ -217,7 +222,10 @@ class ContinuousDetectionWorker:
     def _requested_detectors_for_batch(self, batch_camera_ids: list[object]) -> list[str]:
         requested = ["weapon", "person"]
         if any(
-            self._states.get(str(camera_id), CameraJobState()).pending_hazards
+            (
+                self._states.get(str(camera_id), CameraJobState()).pending_hazards
+                or self._states.get(str(camera_id), CameraJobState()).recorded_file
+            )
             for camera_id in batch_camera_ids
         ):
             requested.extend(["fire", "smoke"])

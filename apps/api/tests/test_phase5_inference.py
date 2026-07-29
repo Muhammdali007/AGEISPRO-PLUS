@@ -447,12 +447,10 @@ async def test_recorded_video_scans_advance_through_playback(
     monkeypatch.setattr(service.media_agent, "capture_opencv_frame", capture_frame)
     CameraDetectionService._video_file_positions.pop(str(camera.id), None)
 
-    await service._load_frame_from_camera(camera)
-    await service._load_frame_from_camera(camera)
-    await service._load_frame_from_camera(camera)
-    await service._load_frame_from_camera(camera)
+    for _ in range(10):
+        await service._load_frame_from_camera(camera)
 
-    assert positions == [0.0, 0.5, 1.0, 1.5]
+    assert positions == pytest.approx([index * 0.2 for index in range(10)])
     assert CameraDetectionService._video_file_positions[str(camera.id)][1] == 0.0
 
 
@@ -610,7 +608,7 @@ async def test_provisional_hazard_types_create_incidents(
     assert incidents[0].metadata_["detection_metadata"]["provisional"] is True
 
 
-def test_provisional_fire_remains_visible_for_fast_feedback() -> None:
+def test_provisional_fire_has_an_immediate_operator_bounding_box() -> None:
     summaries = CameraDetectionService._summarize_detections(
         [
             {
@@ -628,7 +626,157 @@ def test_provisional_fire_remains_visible_for_fast_feedback() -> None:
 
     assert len(summaries) == 1
     assert summaries[0].detection_type == "fire"
+    assert summaries[0].bounding_box is not None
+    assert summaries[0].bounding_box.model_dump() == {
+        "x1": 10.0,
+        "y1": 20.0,
+        "x2": 110.0,
+        "y2": 180.0,
+        "label": "fire",
+    }
     assert summaries[0].metadata["provisional"] is True
+
+
+def test_overlapping_fire_predictions_use_one_enclosing_box_separate_from_smoke() -> None:
+    summaries = CameraDetectionService._summarize_detections(
+        [
+            {
+                "x1": 20,
+                "y1": 20,
+                "x2": 220,
+                "y2": 220,
+                "confidence": 0.91,
+                "label": "smoke",
+                "track_id": "sm-1",
+            },
+            {
+                "x1": 80,
+                "y1": 80,
+                "x2": 180,
+                "y2": 170,
+                "confidence": 0.84,
+                "label": "fire",
+                "track_id": "fi-1",
+            },
+            {
+                "x1": 60,
+                "y1": 70,
+                "x2": 200,
+                "y2": 190,
+                "confidence": 0.81,
+                "label": "fire",
+                "track_id": "fi-2",
+            },
+        ]
+    )
+
+    assert len(summaries) == 2
+    fire = next(summary for summary in summaries if summary.detection_type == "fire")
+    smoke = next(summary for summary in summaries if summary.detection_type == "smoke")
+    assert fire.bounding_box is not None
+    assert fire.bounding_box.model_dump() == {
+        "x1": 60.0,
+        "y1": 70.0,
+        "x2": 200.0,
+        "y2": 190.0,
+        "label": "fire",
+    }
+    assert fire.confidence == 0.84
+    assert fire.metadata["combined_hazard_labels"] == ["fire"]
+    assert smoke.bounding_box is not None
+    assert smoke.bounding_box.label == "smoke"
+    assert smoke.confidence == 0.91
+
+
+def test_separate_fire_and_smoke_keep_separate_operator_boxes() -> None:
+    summaries = CameraDetectionService._summarize_detections(
+        [
+            {
+                "x1": 10,
+                "y1": 10,
+                "x2": 80,
+                "y2": 80,
+                "confidence": 0.88,
+                "label": "fire",
+            },
+            {
+                "x1": 300,
+                "y1": 300,
+                "x2": 390,
+                "y2": 390,
+                "confidence": 0.82,
+                "label": "smoke",
+            },
+        ]
+    )
+
+    assert len(summaries) == 2
+    assert {summary.detection_type for summary in summaries} == {"fire", "smoke"}
+
+
+def test_fragmented_fire_uses_smoke_context_and_discards_isolated_weak_speck() -> None:
+    summaries = CameraDetectionService._summarize_detections(
+        [
+            {
+                "x1": 432.1,
+                "y1": 269.6,
+                "x2": 495.2,
+                "y2": 321.4,
+                "confidence": 0.19,
+                "label": "fire",
+                "provisional": True,
+            },
+            {
+                "x1": 390.5,
+                "y1": 247.7,
+                "x2": 422.4,
+                "y2": 279.2,
+                "confidence": 0.13,
+                "label": "fire",
+                "provisional": True,
+            },
+            {
+                "x1": 594.6,
+                "y1": 109.4,
+                "x2": 720.0,
+                "y2": 440.4,
+                "confidence": 0.12,
+                "label": "smoke",
+                "provisional": True,
+            },
+            {
+                "x1": 179.1,
+                "y1": 1085.3,
+                "x2": 200.4,
+                "y2": 1100.3,
+                "confidence": 0.09,
+                "label": "fire",
+                "provisional": True,
+            },
+            {
+                "x1": 169.7,
+                "y1": 0.4,
+                "x2": 412.9,
+                "y2": 255.5,
+                "confidence": 0.09,
+                "label": "smoke",
+                "provisional": True,
+            },
+        ]
+    )
+
+    assert len(summaries) == 1
+    fire = [summary for summary in summaries if summary.detection_type == "fire"]
+    assert len(fire) == 1
+    assert fire[0].bounding_box is not None
+    assert fire[0].bounding_box.model_dump() == {
+        "x1": 390.5,
+        "y1": 109.4,
+        "x2": 720.0,
+        "y2": 440.4,
+        "label": "fire",
+    }
+    assert fire[0].metadata["combined_hazard_labels"] == ["fire", "smoke"]
 
 
 @pytest.mark.asyncio
@@ -995,6 +1143,20 @@ def test_continuous_worker_uses_separate_hazard_and_recognition_lanes() -> None:
     assert worker._recognition_enabled_for_batch(["cam-a"]) is False
     assert worker._requested_detectors_for_batch(["cam-a", "cam-b"]) == ["weapon", "person", "fire", "smoke"]
     assert worker._recognition_enabled_for_batch(["cam-a", "cam-b"]) is True
+
+
+def test_continuous_worker_runs_all_safety_detectors_for_recorded_video() -> None:
+    worker = ContinuousDetectionWorker()
+    worker._states = {
+        "recording": CameraJobState(recorded_file=True, pending_hazards=False),
+    }
+
+    assert worker._requested_detectors_for_batch(["recording"]) == [
+        "weapon",
+        "person",
+        "fire",
+        "smoke",
+    ]
 
 
 def test_continuous_worker_does_not_mix_expensive_lane_signatures(

@@ -438,9 +438,22 @@ function DetectionOverlay({
     ["weapon", "fire", "smoke", "person", "known_person", "unknown_person"].includes(detection.detection_type)
       || Boolean(detection.face_bounding_box)
   );
-  const knownPeople = detections.filter(
-    (detection) => detection.recognition_status === "known" && detection.identity_label
-  );
+  const knownPeopleByIdentity = new Map<string, CameraDetectionScanSummary>();
+  for (const detection of detections) {
+    if (detection.recognition_status !== "known" || !detection.identity_label) {
+      continue;
+    }
+    const identityKey = detection.identity_id || detection.identity_label.trim().toLowerCase();
+    const existing = knownPeopleByIdentity.get(identityKey);
+    if (
+      !existing
+      || (detection.match_confidence ?? detection.confidence)
+        > (existing.match_confidence ?? existing.confidence)
+    ) {
+      knownPeopleByIdentity.set(identityKey, detection);
+    }
+  }
+  const knownPeople = Array.from(knownPeopleByIdentity.values());
 
   if (!mediaElement || visibleDetections.length === 0) {
     return null;
@@ -483,10 +496,15 @@ function DetectionOverlay({
           );
           const confidence = formatConfidence(detection.confidence);
           const identityDetails = buildPersonSubtitle(detection);
+          const isProvisionalFire =
+            detection.detection_type === "fire"
+            && detection.metadata.provisional === true;
           const title = detection.recognition_status === "known"
             ? "Known Person"
             : detection.recognition_status === "unknown"
               ? "Unknown person"
+            : isProvisionalFire
+              ? "Potential Fire"
             : kind === "face"
               ? "Face"
               : formatDetectionLabel(box.label || detection.detection_type);
@@ -530,16 +548,20 @@ function DetectionOverlay({
       })}
 
       {knownPeople.length > 0 ? (
-        <div className="absolute bottom-4 right-4 max-w-[280px] rounded-[20px] border border-emerald-300/40 bg-slate-950/82 px-4 py-3 text-xs text-emerald-50 shadow-2xl backdrop-blur-md">
+        <div className="absolute bottom-4 right-4 max-w-[300px] rounded-[20px] border border-emerald-300/40 bg-slate-950/82 px-4 py-3 text-xs text-emerald-50 shadow-2xl backdrop-blur-md">
           <p className="text-[10px] uppercase tracking-[0.18em] text-emerald-200/80">Known Person</p>
-          {knownPeople.slice(0, 2).map((person, index) => (
-            <p key={`${person.track_id ?? person.identity_label}-${index}`} className="mt-2 leading-relaxed">
-              <span className="font-semibold">{person.identity_label}</span>
-              {buildPersonSubtitle(person) ? ` | ${buildPersonSubtitle(person)}` : ""}
-            </p>
-          ))}
+          {knownPeople.slice(0, 2).map((person) => {
+            const identityKey = person.identity_id || person.identity_label!.trim().toLowerCase();
+            return (
+              <p key={identityKey} className="mt-2 leading-relaxed">
+                <span className="font-semibold">{person.identity_label}</span>
+                {buildPersonSubtitle(person) ? ` | ${buildPersonSubtitle(person)}` : ""}
+              </p>
+            );
+          })}
         </div>
       ) : null}
+
     </div>
   );
 }
